@@ -1,18 +1,265 @@
-import React, { useState } from 'react';
-import { Server, Plus, RefreshCw, CheckCircle2, Globe, Cpu, Sliders, ExternalLink, HelpCircle, Trash2, X, Pencil } from 'lucide-react';
-import { Provider, ModelConfig } from '../../types';
+import React, { useEffect, useState } from 'react';
+import { Server, Plus, RefreshCw, CheckCircle2, Globe, Cpu, Sliders, ExternalLink, HelpCircle, Trash2, X, Pencil, Search } from 'lucide-react';
+import { Provider, ModelConfig, Account } from '../../types';
 import { WobblyCard, SketchButton, SketchBadge } from '../HandDrawnElements';
 import { DESIGN_TOKENS } from '../../lib/designSystem';
-import { Kinetix, DiscoveredModel } from '../../lib/resources';
+import { Kinetix, DiscoveredModel, ProviderLifecycleStatus } from '../../lib/resources';
 
 /**
- * Fallback token metadata used when an upstream does not declare a context
- * window / max output. Applied both as the model form's initial values and as
- * the final fallback when creating, importing, or rendering a model, so an
- * "unknown" value never round-trips as 0.
+ * Defaults for newly configured manual models. Imported/discovered sparse
+ * metadata remains null/undefined until the operator explicitly sets it.
  */
 const DEFAULT_CONTEXT_WINDOW = 200000;
 const DEFAULT_MAX_OUTPUT = 8192;
+const PROBE_MAX_REQUESTS = 1;
+const PROBE_MAX_COST_USD = 0.05;
+const CANONICAL_THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+type CanonicalThinkingLevel = (typeof CANONICAL_THINKING_LEVELS)[number];
+
+const thinkingValueToInput = (value: unknown): string => {
+  if (value === undefined) return '';
+  return JSON.stringify(value) ?? '';
+};
+
+const parseThinkingInput = (raw: string): unknown => {
+  const value = raw.trim();
+  if (!value) return undefined;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+};
+
+const pluginManagedReasoning = (model: ModelConfig) => {
+  const discovery = model.discovery as {
+    reasoning_capability?: {
+      levels?: string[];
+      default?: string | null;
+    } | null;
+    provider_variant?: {
+      kind?: string;
+      id?: string;
+      reasoning_level?: string | null;
+      fixed?: boolean;
+    } | null;
+    capability_sources?: {
+      reasoning?: string | null;
+    } | null;
+  } | undefined;
+  const source = discovery?.capability_sources?.reasoning;
+  if (!source?.includes('plugin_capabilities_json')) return null;
+  return {
+    capability: discovery?.reasoning_capability || null,
+    variant: discovery?.provider_variant || null,
+  };
+};
+
+const modelReconciliation = (model: ModelConfig) =>
+  (model.discovery as {
+    reconciliation?: {
+      status?: string;
+      checked_at?: string | null;
+      last_success_at?: string | null;
+      diff?: Array<{ field?: string; configured?: unknown; observed?: unknown; source?: unknown }>;
+      pinned_fields?: string[];
+      deprecation?: {
+        source?: string;
+        end_date?: unknown;
+        effective_date?: unknown;
+        replacement?: unknown;
+      } | null;
+    } | null;
+  } | undefined)?.reconciliation || null;
+
+type PricingField =
+  | 'input_per_1m'
+  | 'output_per_1m'
+  | 'cached_per_1m'
+  | 'cache_write_per_1m'
+  | 'thinking_per_1m';
+
+type PricingObservation = {
+  prices?: Partial<Record<PricingField, number | null>> | null;
+  price_sources?: Partial<Record<PricingField, string | null>> | null;
+  catalog?: {
+    source_state?: {
+      source?: string | null;
+      retrieved_at?: string | null;
+      freshness?: string | null;
+    } | null;
+  } | null;
+};
+
+const modelPricingDetails = (model: ModelConfig) => {
+  const discovery = model.discovery as {
+    effective_pricing?: {
+      source?: string | null;
+      fields?: Partial<Record<PricingField, { source?: string | null }>> | null;
+      updated_at?: string | null;
+    } | null;
+    latest_observation?: PricingObservation | null;
+    prices?: PricingObservation['prices'];
+    price_sources?: PricingObservation['price_sources'];
+    catalog?: PricingObservation['catalog'];
+  } | undefined;
+  const observation: PricingObservation = discovery?.latest_observation || {
+    prices: discovery?.prices,
+    price_sources: discovery?.price_sources,
+    catalog: discovery?.catalog,
+  };
+  return {
+    effectiveSource: discovery?.effective_pricing?.source || 'untracked',
+    effectiveFields: discovery?.effective_pricing?.fields || {},
+    observation,
+  };
+};
+
+const formatPricingValue = (value: number | null | undefined) =>
+  value == null ? 'unknown' : `${value} / 1M`;
+
+const effectivePricingCell = (
+  model: ModelConfig,
+  pricing: ReturnType<typeof modelPricingDetails>,
+  field: PricingField,
+) => {
+  const values: Record<PricingField, number | null> = {
+    input_per_1m: model.prices.inputPer1M,
+    output_per_1m: model.prices.outputPer1M,
+    cached_per_1m: model.prices.cachedPer1M,
+    cache_write_per_1m: model.prices.cacheWritePer1M,
+    thinking_per_1m: model.prices.thinkingPer1M,
+  };
+  const direct = values[field];
+  if (direct != null) {
+    return {
+      value: direct,
+      source: pricing.effectiveFields[field]?.source || pricing.effectiveSource,
+      fallback: null as string | null,
+    };
+  }
+
+  const fallbackField =
+    field === 'cached_per_1m' || field === 'cache_write_per_1m'
+      ? 'input_per_1m'
+      : field === 'thinking_per_1m'
+        ? 'output_per_1m'
+        : null;
+  const fallbackValue = fallbackField ? values[fallbackField] : null;
+  if (fallbackField && fallbackValue != null) {
+    return {
+      value: fallbackValue,
+      source: pricing.effectiveFields[fallbackField]?.source || pricing.effectiveSource,
+      fallback:
+        fallbackField === 'input_per_1m'
+          ? 'input-rate fallback'
+          : 'output-rate fallback',
+    };
+  }
+
+  return {
+    value: null,
+    source: pricing.effectiveFields[field]?.source || pricing.effectiveSource,
+    fallback: null as string | null,
+  };
+};
+
+const formatPricingTimestamp = (value: string | null | undefined) => {
+  if (!value) return '—';
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString();
+};
+
+type ProbeEvidenceEntry = {
+  status?: string;
+  verified_at?: string;
+  fresh_until?: string;
+  estimated_max_cost_usd?: number;
+  scope?: {
+    provider_id?: string;
+    account_id?: string;
+    model_id?: string;
+    transport?: string;
+  };
+};
+
+const modelProbeEvidence = (model: ModelConfig) =>
+  (model.discovery as {
+    probe_evidence?: Record<string, ProbeEvidenceEntry | ProbeEvidenceEntry[]> | null;
+  } | undefined)?.probe_evidence || {};
+
+const probeEvidenceEntries = (model: ModelConfig, key: string): ProbeEvidenceEntry[] => {
+  const evidence = modelProbeEvidence(model)[key];
+  if (!evidence) return [];
+  return Array.isArray(evidence) ? evidence : [evidence];
+};
+
+const probeEvidenceSummary = (model: ModelConfig, key: string, accountId: string) => {
+  const entries = probeEvidenceEntries(model, key).filter(
+    (entry) => !accountId || entry.scope?.account_id === accountId,
+  );
+  if (!entries.length) return '—';
+  return entries
+    .map((entry) => {
+      const verifiedAt = entry.verified_at ? new Date(entry.verified_at) : null;
+      const verifiedLabel =
+        verifiedAt && !Number.isNaN(verifiedAt.getTime())
+          ? verifiedAt.toLocaleString()
+          : entry.verified_at || 'unknown';
+      const freshUntil = entry.fresh_until ? new Date(entry.fresh_until) : null;
+      const freshness =
+        freshUntil && !Number.isNaN(freshUntil.getTime())
+          ? freshUntil.getTime() > Date.now()
+            ? 'fresh'
+            : 'expired'
+          : 'freshness unknown';
+      const cost =
+        typeof entry.estimated_max_cost_usd === 'number'
+          ? ` · ≤ USD ${entry.estimated_max_cost_usd.toFixed(6)}`
+          : '';
+      return `${entry.scope?.transport || 'unknown'}:${entry.status || '—'} · verified ${verifiedLabel} · ${freshness}${cost}`;
+    })
+    .join(' / ');
+};
+
+const modelProbeTransport = (model: ModelConfig, provider: Provider) => {
+  const discovery = model.discovery as {
+    transport?: { format?: string } | null;
+  } | undefined;
+  // Plugin binding is the actual runtime target transport. Discovered transport
+  // is descriptive metadata and must not make the probe target label lie.
+  if (provider.wireFormat === 'plugin') return provider.wirePlugin || 'plugin';
+  if (model.transportOverride) return model.transportOverride;
+  if (discovery?.transport?.format) return discovery.transport.format;
+  return provider.wireFormat;
+};
+
+const modelReasoningLevels = (model: ModelConfig) => {
+  const discovery = model.discovery as {
+    reasoning_capability?: { levels?: string[]; can_disable?: boolean } | null;
+    latest_observation?: {
+      reasoning_capability?: { levels?: string[]; can_disable?: boolean } | null;
+    } | null;
+  } | undefined;
+  const discovered =
+    discovery?.latest_observation?.reasoning_capability?.levels
+    || discovery?.reasoning_capability?.levels
+    || [];
+  const mapped = Object.keys(model.thinkingMap?.levels || {});
+  return Array.from(new Set([...discovered, ...mapped])).filter((level) => level && level !== 'off' && level !== 'default');
+};
+
+const formatDriftValue = (value: unknown) => {
+  if (value === undefined) return 'undefined';
+  const serialized = JSON.stringify(value, null, 2);
+  return serialized === undefined ? String(value) : serialized;
+};
+
+const modelCanProbeReasoningDisable = (model: ModelConfig, provider: Provider) => {
+  const transport = modelProbeTransport(model, provider);
+  return transport === 'openai' || transport === 'openai-responses';
+};
+
 
 interface ProvidersViewProps {
   providers: Provider[];
@@ -45,7 +292,36 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
   const [isDiscovering, setIsDiscovering] = useState(false);
   const [discoveryResults, setDiscoveryResults] = useState<DiscoveredModel[] | null>(null);
   const [discoverySearch, setDiscoverySearch] = useState('');
+  const [providerSearch, setProviderSearch] = useState('');
   const [pingStatus, setPingStatus] = useState<Record<string, { ok: boolean; pingMs: number; error?: string }>>({});
+  const [lifecycleBusy, setLifecycleBusy] = useState<string | null>(null);
+  const [lifecycleNotice, setLifecycleNotice] = useState<string | null>(null);
+  const [probeStatus, setProbeStatus] = useState<Record<string, string>>({});
+  const [lifecycleSettings, setLifecycleSettings] = useState<{
+    reconciliation_interval_secs: number;
+    pricing_sync_interval_secs: number;
+    jitter_secs: number;
+    probe_freshness_secs: number;
+  } | null>(null);
+  const [savingLifecycleSettings, setSavingLifecycleSettings] = useState(false);
+  const [providerLifecycle, setProviderLifecycle] = useState<ProviderLifecycleStatus | null>(null);
+  const [reconciliationSelections, setReconciliationSelections] = useState<Record<string, string[]>>({});
+  const [probeAccounts, setProbeAccounts] = useState<Account[]>([]);
+  const [probeAccountByProvider, setProbeAccountByProvider] = useState<Record<string, string>>({});
+  const [probeTransportByModel, setProbeTransportByModel] = useState<Record<string, string>>({});
+
+  useEffect(() => {
+    Kinetix.modelLifecycleSettings()
+      .then(setLifecycleSettings)
+      .catch(() => setLifecycleSettings(null));
+  }, []);
+
+  useEffect(() => {
+    Kinetix.accounts()
+      .then(setProbeAccounts)
+      .catch(() => setProbeAccounts([]));
+  }, []);
+
 
   // New Provider Form State
   const [name, setName] = useState('');
@@ -88,20 +364,95 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
   // New Custom Model Form State
   const [modelUpstreamId, setModelUpstreamId] = useState('');
   const [modelDisplayName, setModelDisplayName] = useState('');
+  const [modelTransportOverride, setModelTransportOverride] = useState('');
   const [modelContextWindow, setModelContextWindow] = useState(DEFAULT_CONTEXT_WINDOW);
   const [modelMaxOutput, setModelMaxOutput] = useState(DEFAULT_MAX_OUTPUT);
-  const [modelInputPrice, setModelInputPrice] = useState(1.0);
-  const [modelOutputPrice, setModelOutputPrice] = useState(4.0);
-  const [capText, setCapText] = useState(true);
-  const [capVision, setCapVision] = useState(true);
-  const [capReasoning, setCapReasoning] = useState(false);
-  const [capTools, setCapTools] = useState(true);
+  const [modelInputPrice, setModelInputPrice] = useState<number | null>(1.0);
+  const [modelOutputPrice, setModelOutputPrice] = useState<number | null>(4.0);
+  const [modelCachedPrice, setModelCachedPrice] = useState<number | null>(0);
+  const [modelCacheWritePrice, setModelCacheWritePrice] = useState<number | null>(0);
+  const [modelThinkingPrice, setModelThinkingPrice] = useState<number | null>(0);
+  const [capText, setCapText] = useState<boolean | undefined>(true);
+  const [capVision, setCapVision] = useState<boolean | undefined>(true);
+  const [capReasoning, setCapReasoning] = useState<boolean | undefined>(false);
+  const [capTools, setCapTools] = useState<boolean | undefined>(true);
+  const [capStructuredOutput, setCapStructuredOutput] = useState<boolean | undefined>(false);
+  const [modelThinkingOff, setModelThinkingOff] = useState('');
+  const [modelThinkingMinimal, setModelThinkingMinimal] = useState('');
+  const [modelThinkingLow, setModelThinkingLow] = useState('');
+  const [modelThinkingMedium, setModelThinkingMedium] = useState('');
+  const [modelThinkingHigh, setModelThinkingHigh] = useState('');
+  const [modelThinkingXHigh, setModelThinkingXHigh] = useState('');
+  const [modelThinkingMax, setModelThinkingMax] = useState('');
+  const [modelThinkingMode, setModelThinkingMode] = useState<'' | 'manual_budget' | 'level' | 'adaptive'>('');
+  const [modelThinkingBudgetField, setModelThinkingBudgetField] = useState('');
+  const [modelThinkingLevelField, setModelThinkingLevelField] = useState('');
+  const [modelThinkingExtraLevels, setModelThinkingExtraLevels] = useState<Record<string, unknown>>({});
   const [modelValidation, setModelValidation] = useState<{ valid: boolean; problems: string[]; warnings: string[] } | null>(null);
   const [validatingModel, setValidatingModel] = useState(false);
   const [editingModelId, setEditingModelId] = useState<string | null>(null);
 
-  const activeProvider = providers.find((p) => p.id === selectedProviderId) || providers[0];
+  const providerQuery = providerSearch.trim().toLowerCase();
+  const filteredProviders = providers.filter((p) => {
+    if (!providerQuery) return true;
+    return [p.id, p.name, p.baseUrl, p.wireFormat, p.authScheme]
+      .some((value) => String(value ?? '').toLowerCase().includes(providerQuery));
+  });
+  const activeProvider =
+    filteredProviders.find((p) => p.id === selectedProviderId) ||
+    filteredProviders[0];
   const providerModels = models.filter((m) => m.providerId === activeProvider?.id);
+  const probeAccountsForProvider = (providerId: string) =>
+    probeAccounts.filter((account) => account.providerId === providerId);
+  const selectedProbeAccountId = (providerId: string) => {
+    const accounts = probeAccountsForProvider(providerId);
+    const selected = probeAccountByProvider[providerId];
+    if (selected && accounts.some((account) => account.id === selected)) return selected;
+    return accounts.find((account) => account.status === 'healthy')?.id || accounts[0]?.id || '';
+  };
+  const selectedProbeAccount = (providerId: string) => {
+    const accountId = selectedProbeAccountId(providerId);
+    return probeAccounts.find((account) => account.id === accountId);
+  };
+  const probeTransportInputValue = (model: ModelConfig) => {
+    if (Object.prototype.hasOwnProperty.call(probeTransportByModel, model.id)) {
+      return probeTransportByModel[model.id];
+    }
+    const provider = providers.find((candidate) => candidate.id === model.providerId);
+    return provider ? modelProbeTransport(model, provider) : '';
+  };
+  const selectedProbeTransport = (model: ModelConfig) => {
+    const provider = providers.find((candidate) => candidate.id === model.providerId);
+    const fallback = provider ? modelProbeTransport(model, provider) : '';
+    return probeTransportInputValue(model).trim() || fallback;
+  };
+  const probeStatusKey = (
+    model: ModelConfig,
+    capability: string,
+    value?: string,
+  ) =>
+    `${model.id}:${capability}${value ? `:${value}` : ''}:transport:${selectedProbeTransport(model)}`;
+
+  useEffect(() => {
+    if (!activeProvider) {
+      setDiscoveryResults(null);
+      setProviderLifecycle(null);
+      return;
+    }
+    let cancelled = false;
+    Kinetix.cachedDiscovery(activeProvider.id)
+      .then((cached) => {
+        if (cancelled) return;
+        setDiscoveryResults(cached.models);
+        setProviderLifecycle(cached.lifecycle);
+      })
+      .catch(() => {
+        if (!cancelled) setProviderLifecycle(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeProvider?.id]);
 
   // Fuzzy search over the discovered model list: case-insensitive, and every
   // whitespace-separated term must match as a subsequence of the model id.
@@ -141,6 +492,107 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
     }
   };
 
+  const handleReconcileProvider = async () => {
+    if (!activeProvider) return;
+    setLifecycleBusy('reconcile');
+    setLifecycleNotice(null);
+    try {
+      const result = await Kinetix.reconcileProvider(activeProvider.id);
+      setDiscoveryResults(result.models);
+      setProviderLifecycle(result.lifecycle);
+      setLifecycleNotice(`Reconciled ${result.models.length} upstream model observations.`);
+      onRefresh?.();
+    } catch (error) {
+      setLifecycleNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      setLifecycleBusy(null);
+    }
+  };
+
+  const handleSyncPricing = async () => {
+    if (!activeProvider) return;
+    setLifecycleBusy('pricing');
+    setLifecycleNotice(null);
+    try {
+      const result = await Kinetix.syncProviderPricing(activeProvider.id);
+      setProviderLifecycle(result.lifecycle);
+      setLifecycleNotice(
+        `Pricing sync updated ${result.updated.length}; preserved ${result.skipped_manual.length} manual models.`,
+      );
+      onRefresh?.();
+    } catch (error) {
+      setLifecycleNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      setLifecycleBusy(null);
+    }
+  };
+
+  const handleReconciliationAction = async (
+    modelId: string,
+    action: 'accept' | 'ignore' | 'pin',
+    fields: string[] = [],
+  ) => {
+    setLifecycleBusy(`${action}:${modelId}`);
+    try {
+      await Kinetix.reconcileModel(modelId, action, fields);
+      setLifecycleNotice(`Model drift ${action} completed.`);
+      setReconciliationSelections((current) => ({ ...current, [modelId]: [] }));
+      onRefresh?.();
+    } catch (error) {
+      setLifecycleNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      setLifecycleBusy(null);
+    }
+  };
+
+  const handleProbeModel = async (
+    model: ModelConfig,
+    capability: 'transport' | 'reasoning' | 'reasoning_disable' | 'tool_calling' | 'structured_output',
+    value?: string,
+  ) => {
+    const key = probeStatusKey(model, capability, value);
+    const accountId = selectedProbeAccountId(model.providerId);
+    const transport = selectedProbeTransport(model);
+    if (!accountId) {
+      setProbeStatus((prev) => ({ ...prev, [key]: 'select an account' }));
+      return;
+    }
+    setLifecycleBusy(`probe:${key}`);
+    try {
+      const result = await Kinetix.probeModel(
+        model.id,
+        capability,
+        value,
+        PROBE_MAX_COST_USD,
+        accountId,
+        transport,
+      );
+      setProbeStatus((prev) => ({ ...prev, [key]: result.status }));
+      onRefresh?.();
+    } catch (error) {
+      setProbeStatus((prev) => ({
+        ...prev,
+        [key]: error instanceof Error ? error.message : String(error),
+      }));
+    } finally {
+      setLifecycleBusy(null);
+    }
+  };
+
+  const handleSaveLifecycleSettings = async () => {
+    if (!lifecycleSettings) return;
+    setSavingLifecycleSettings(true);
+    try {
+      const saved = await Kinetix.updateModelLifecycleSettings(lifecycleSettings);
+      setLifecycleSettings(saved);
+      setLifecycleNotice('Lifecycle schedule saved.');
+    } catch (error) {
+      setLifecycleNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSavingLifecycleSettings(false);
+    }
+  };
+
   const handleFetchModelsDiscovery = async () => {
     if (!activeProvider) return;
     setIsDiscovering(true);
@@ -165,6 +617,9 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
   };
 
   const handleImportDiscoveredModel = (m: DiscoveredModel) => {
+    if (m.execution_supported === false) return;
+    const discoveredThinking = m.thinking_map;
+    const discoveredPrices = m.prices;
     const newModel: ModelConfig = {
       id: '',
       providerId: activeProvider.id,
@@ -172,23 +627,60 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
       upstreamModelId: m.id,
       displayName: m.display_name || m.id,
       enabled: true,
-      contextWindow: m.context_window ?? DEFAULT_CONTEXT_WINDOW,
-      maxOutputTokens: m.max_output_tokens ?? DEFAULT_MAX_OUTPUT,
+      contextWindow: m.context_window ?? null,
+      maxOutputTokens: m.max_output_tokens ?? null,
       capabilities: {
-        text: true,
-        vision: false,
-        reasoning: m.id.includes('pro') || m.id.includes('thinking'),
-        toolCalling: true,
-        audio: false,
+        text: m.capabilities?.text ?? undefined,
+        vision: m.capabilities?.vision ?? undefined,
+        reasoning:
+          m.capabilities?.reasoning ??
+          (m.reasoning_capability ? true : undefined),
+        toolCalling: m.capabilities?.tool_calling ?? undefined,
+        structuredOutput: m.capabilities?.structured_output ?? undefined,
       },
       prices: {
-        inputPer1M: 0,
-        outputPer1M: 0,
-        cachedPer1M: 0,
-        thinkingPer1M: 0,
+        inputPer1M: discoveredPrices?.input_per_1m ?? null,
+        outputPer1M: discoveredPrices?.output_per_1m ?? null,
+        cachedPer1M: discoveredPrices?.cached_per_1m ?? null,
+        cacheWritePer1M: discoveredPrices?.cache_write_per_1m ?? null,
+        thinkingPer1M: discoveredPrices?.thinking_per_1m ?? null,
       },
       parameters: {},
-      thinkingMap: { scale: 'off', mappedField: '' },
+      thinkingMap: discoveredThinking
+        ? {
+            levels: { ...discoveredThinking.levels },
+            mode:
+              discoveredThinking.mode === 'manual_budget' ||
+              discoveredThinking.mode === 'level' ||
+              discoveredThinking.mode === 'adaptive'
+                ? discoveredThinking.mode
+                : undefined,
+            budgetField: discoveredThinking.budget_field || undefined,
+            levelField: discoveredThinking.level_field || undefined,
+          }
+        : { levels: {} },
+      discovery: {
+        capabilities: m.capabilities || {},
+        reasoning_capability: m.reasoning_capability || null,
+        thinking_map: m.thinking_map || null,
+        transport: m.transport ? { format: m.transport } : null,
+        transport_source: m.transport_source || null,
+        capability_sources: m.capability_sources || {},
+        modalities: m.modalities || null,
+        prices: m.prices || null,
+        price_sources: m.price_sources || {},
+        raw_metadata: m.raw_metadata ?? null,
+        raw_metadata_truncated: m.raw_metadata_truncated ?? false,
+        canonical_identity: m.canonical_identity || null,
+        canonical_model_id: m.canonical_model_id || null,
+        canonical_match: m.canonical_match || null,
+        provider_variant: m.provider_variant || null,
+        opaque_state: m.opaque_state || null,
+        model_type: m.model_type || null,
+        execution_supported: m.execution_supported ?? true,
+        catalog: m.catalog || null,
+        imported_from_discovery: true,
+      },
     };
 
     onAddModel(newModel);
@@ -286,6 +778,9 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
     e.preventDefault();
     if (!name.trim() || !baseUrl.trim()) return;
 
+    const existingProvider = editingProviderId
+      ? providers.find((provider) => provider.id === editingProviderId)
+      : undefined;
     const prov: Provider = {
       id: editingProviderId || '',
       name: name.trim(),
@@ -297,6 +792,12 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
       status: 'healthy',
       modelsCount: 0,
       accountsCount: 0,
+      credentialMode: existingProvider?.credentialMode ?? 'manual',
+      credentialEnrollment: existingProvider?.credentialEnrollment ?? {
+        mode: 'manual',
+        actionLabel: 'Add API Key',
+        available: true,
+      },
       extraHeaders: parseHeaders(extraHeaders),
       modelsPath: modelsPath.trim() || undefined,
       timeoutMs,
@@ -334,19 +835,79 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
     }
   };
 
+  const currentThinkingMap = (): ModelConfig['thinkingMap'] => {
+    const levels = { ...modelThinkingExtraLevels };
+    const inputs: Record<CanonicalThinkingLevel, string> = {
+      off: modelThinkingOff,
+      minimal: modelThinkingMinimal,
+      low: modelThinkingLow,
+      medium: modelThinkingMedium,
+      high: modelThinkingHigh,
+      xhigh: modelThinkingXHigh,
+      max: modelThinkingMax,
+    };
+    for (const level of CANONICAL_THINKING_LEVELS) {
+      const value = parseThinkingInput(inputs[level]);
+      if (value === undefined) {
+        delete levels[level];
+      } else {
+        levels[level] = value;
+      }
+    }
+    return {
+      levels,
+      mode: modelThinkingMode || undefined,
+      budgetField:
+        modelThinkingMode === 'level' || modelThinkingMode === 'adaptive'
+          ? undefined
+          : modelThinkingBudgetField.trim() || undefined,
+      levelField:
+        modelThinkingMode === 'level' || modelThinkingMode === 'adaptive'
+          ? modelThinkingLevelField.trim() || undefined
+          : undefined,
+    };
+  };
+
+  const thinkingLevelInputs = [
+    ['off', modelThinkingOff, setModelThinkingOff],
+    ['minimal', modelThinkingMinimal, setModelThinkingMinimal],
+    ['low', modelThinkingLow, setModelThinkingLow],
+    ['medium', modelThinkingMedium, setModelThinkingMedium],
+    ['high', modelThinkingHigh, setModelThinkingHigh],
+    ['xhigh', modelThinkingXHigh, setModelThinkingXHigh],
+    ['max', modelThinkingMax, setModelThinkingMax],
+  ] as const;
+
   /** Prefill the model form for editing an existing model. */
   const openEditModel = (m: ModelConfig) => {
     setEditingModelId(m.id);
     setModelUpstreamId(m.upstreamModelId);
     setModelDisplayName(m.displayName);
-    setModelContextWindow(m.contextWindow || DEFAULT_CONTEXT_WINDOW);
-    setModelMaxOutput(m.maxOutputTokens || DEFAULT_MAX_OUTPUT);
-    setModelInputPrice(m.prices.inputPer1M || 0);
-    setModelOutputPrice(m.prices.outputPer1M || 0);
+    setModelTransportOverride(m.transportOverride || '');
+    setModelContextWindow(m.contextWindow ?? 0);
+    setModelMaxOutput(m.maxOutputTokens ?? 0);
+    setModelInputPrice(m.prices.inputPer1M);
+    setModelOutputPrice(m.prices.outputPer1M);
+    setModelCachedPrice(m.prices.cachedPer1M);
+    setModelCacheWritePrice(m.prices.cacheWritePer1M);
+    setModelThinkingPrice(m.prices.thinkingPer1M);
     setCapText(m.capabilities.text);
     setCapVision(m.capabilities.vision);
     setCapReasoning(m.capabilities.reasoning);
     setCapTools(m.capabilities.toolCalling);
+    setCapStructuredOutput(m.capabilities.structuredOutput);
+    const { off, minimal, low, medium, high, xhigh, max, ...extraLevels } = m.thinkingMap.levels;
+    setModelThinkingOff(thinkingValueToInput(off));
+    setModelThinkingMinimal(thinkingValueToInput(minimal));
+    setModelThinkingLow(thinkingValueToInput(low));
+    setModelThinkingMedium(thinkingValueToInput(medium));
+    setModelThinkingHigh(thinkingValueToInput(high));
+    setModelThinkingXHigh(thinkingValueToInput(xhigh));
+    setModelThinkingMax(thinkingValueToInput(max));
+    setModelThinkingMode(m.thinkingMap.mode || '');
+    setModelThinkingBudgetField(m.thinkingMap.budgetField || '');
+    setModelThinkingLevelField(m.thinkingMap.levelField || '');
+    setModelThinkingExtraLevels(extraLevels);
     setModelValidation(null);
     setShowAddModelModal(true);
   };
@@ -355,50 +916,72 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
     setEditingModelId(null);
     setModelUpstreamId('');
     setModelDisplayName('');
+    setModelTransportOverride('');
     setModelContextWindow(DEFAULT_CONTEXT_WINDOW);
     setModelMaxOutput(DEFAULT_MAX_OUTPUT);
     setModelInputPrice(1.0);
     setModelOutputPrice(4.0);
+    setModelCachedPrice(0);
+    setModelCacheWritePrice(0);
+    setModelThinkingPrice(0);
     setCapText(true);
     setCapVision(true);
     setCapReasoning(false);
     setCapTools(true);
+    setCapStructuredOutput(false);
+    setModelThinkingOff('');
+    setModelThinkingMinimal('');
+    setModelThinkingLow('');
+    setModelThinkingMedium('');
+    setModelThinkingHigh('');
+    setModelThinkingXHigh('');
+    setModelThinkingMax('');
+    setModelThinkingMode('');
+    setModelThinkingBudgetField('');
+    setModelThinkingLevelField('');
+    setModelThinkingExtraLevels({});
     setModelValidation(null);
   };
+
+  const normalizedPrice = (value: number | null): number | null =>
+    typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
 
   const handleCreateCustomModel = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!modelUpstreamId.trim()) return;
 
+    const editingModel = editingModelId
+      ? models.find((model) => model.id === editingModelId)
+      : undefined;
     const newModel: ModelConfig = {
       id: editingModelId || '',
       providerId: activeProvider.id,
       providerName: activeProvider.name,
       upstreamModelId: modelUpstreamId.trim(),
       displayName: modelDisplayName.trim() || modelUpstreamId.trim(),
-      enabled: editingModelId
-        ? (models.find((m) => m.id === editingModelId)?.enabled ?? true)
-        : true,
-      contextWindow: Number(modelContextWindow) || DEFAULT_CONTEXT_WINDOW,
-      maxOutputTokens: Number(modelMaxOutput) || DEFAULT_MAX_OUTPUT,
+      transportOverride: modelTransportOverride.trim() || null,
+      enabled: editingModel?.enabled ?? true,
+      contextWindow:
+        Number(modelContextWindow) || (editingModelId ? null : DEFAULT_CONTEXT_WINDOW),
+      maxOutputTokens:
+        Number(modelMaxOutput) || (editingModelId ? null : DEFAULT_MAX_OUTPUT),
       capabilities: {
         text: capText,
         vision: capVision,
         reasoning: capReasoning,
         toolCalling: capTools,
-        audio: false,
+        audio: editingModelId ? editingModel?.capabilities.audio : false,
+        structuredOutput: capStructuredOutput,
       },
       prices: {
-        inputPer1M: Number(modelInputPrice) || 0,
-        outputPer1M: Number(modelOutputPrice) || 0,
-        cachedPer1M: Number(modelInputPrice ? (modelInputPrice * 0.25).toFixed(2) : 0),
-        thinkingPer1M: capReasoning ? Number(modelOutputPrice) || 0 : 0,
+        inputPer1M: normalizedPrice(modelInputPrice),
+        outputPer1M: normalizedPrice(modelOutputPrice),
+        cachedPer1M: normalizedPrice(modelCachedPrice),
+        cacheWritePer1M: normalizedPrice(modelCacheWritePrice),
+        thinkingPer1M: normalizedPrice(modelThinkingPrice),
       },
       parameters: {},
-      thinkingMap: {
-        scale: capReasoning ? 'medium' : 'off',
-        mappedField: capReasoning ? 'thinkingConfig' : '',
-      },
+      thinkingMap: currentThinkingMap(),
     };
 
     if (editingModelId) {
@@ -410,18 +993,43 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
     resetModelForm();
   };
 
-  const modelBody = () => ({
-    upstream_id: modelUpstreamId.trim(),
-    display_name: modelDisplayName.trim() || modelUpstreamId.trim(),
-    enabled: true,
-    context_window: Number(modelContextWindow) || DEFAULT_CONTEXT_WINDOW,
-    max_output_tokens: Number(modelMaxOutput) || DEFAULT_MAX_OUTPUT,
-    capabilities: { text: capText, vision: capVision, reasoning: capReasoning, tool_calling: capTools, audio: false },
-    prices: {
-      input_per_1m: Number(modelInputPrice) || null,
-      output_per_1m: Number(modelOutputPrice) || null,
-    },
-  });
+  const modelBody = () => {
+    const thinkingMap = currentThinkingMap();
+    const editingModel = editingModelId
+      ? models.find((model) => model.id === editingModelId)
+      : undefined;
+    return {
+      upstream_id: modelUpstreamId.trim(),
+      display_name: modelDisplayName.trim() || modelUpstreamId.trim(),
+      transport_override: modelTransportOverride.trim() || null,
+      enabled: true,
+      context_window:
+        Number(modelContextWindow) || (editingModelId ? null : DEFAULT_CONTEXT_WINDOW),
+      max_output_tokens:
+        Number(modelMaxOutput) || (editingModelId ? null : DEFAULT_MAX_OUTPUT),
+      capabilities: {
+        text: capText,
+        vision: capVision,
+        reasoning: capReasoning,
+        tool_calling: capTools,
+        audio: editingModelId ? editingModel?.capabilities.audio : false,
+        structured_output: capStructuredOutput,
+      },
+      prices: {
+        input_per_1m: normalizedPrice(modelInputPrice),
+        output_per_1m: normalizedPrice(modelOutputPrice),
+        cached_per_1m: normalizedPrice(modelCachedPrice),
+        cache_write_per_1m: normalizedPrice(modelCacheWritePrice),
+        thinking_per_1m: normalizedPrice(modelThinkingPrice),
+      },
+      thinking_map: {
+        levels: thinkingMap.levels,
+        mode: thinkingMap.mode || null,
+        budget_field: thinkingMap.budgetField || null,
+        level_field: thinkingMap.levelField || null,
+      },
+    };
+  };
 
   const handleValidateModel = async () => {
     if (!modelUpstreamId.trim()) return;
@@ -493,10 +1101,41 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
           <div className="space-y-4">
             <h3 className="text-xl font-heading font-bold text-[var(--ink)] flex items-center gap-2">
               <Server className="w-5 h-5 text-[var(--pen-blue)]" />
-              Configured Upstreams ({providers.length})
+              Configured Upstreams ({filteredProviders.length}/{providers.length})
             </h3>
 
-            {providers.map((prov, idx) => {
+            <div className="relative">
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-[var(--ink)]/50" />
+              <input
+                type="search"
+                value={providerSearch}
+                onChange={(e) => setProviderSearch(e.target.value)}
+                placeholder="Search providers…"
+                className="w-full pl-9 pr-9 py-2 bg-[var(--surface)] border-2 border-[var(--ink)] font-mono text-sm focus:outline-none focus:border-[var(--pen-blue)]"
+                style={{ borderRadius: DESIGN_TOKENS.radii.wobblyMd }}
+              />
+              {providerSearch && (
+                <button
+                  type="button"
+                  onClick={() => setProviderSearch('')}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-[var(--ink)]/60 hover:text-[var(--marker-red)] cursor-pointer"
+                  title="Clear search"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              )}
+            </div>
+
+            {filteredProviders.length === 0 && (
+              <div className="p-5 text-center bg-[var(--surface)] border-2 border-dashed border-[var(--ink)]/30 rounded">
+                <p className="text-sm font-mono text-[var(--ink)]/70">No providers match “{providerSearch}”.</p>
+                <button onClick={() => setProviderSearch('')} className="mt-2 text-xs font-heading font-bold text-[var(--pen-blue)] hover:underline cursor-pointer">
+                  Clear search
+                </button>
+              </div>
+            )}
+
+            {filteredProviders.map((prov, idx) => {
               const isSelected = prov.id === activeProvider?.id;
               const tilt = idx % 2 === 0 ? '-rotate-0.5' : 'rotate-0.5';
               const ping = pingStatus[prov.id];
@@ -585,6 +1224,25 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                     <SketchButton
                       variant="secondary"
                       size="sm"
+                      disabled={lifecycleBusy === 'reconcile'}
+                      onClick={handleReconcileProvider}
+                      className="gap-1.5 font-heading"
+                    >
+                      <RefreshCw className={`w-4 h-4 ${lifecycleBusy === 'reconcile' ? 'animate-spin' : ''}`} />
+                      Reconcile
+                    </SketchButton>
+                    <SketchButton
+                      variant="secondary"
+                      size="sm"
+                      disabled={lifecycleBusy === 'pricing'}
+                      onClick={handleSyncPricing}
+                      className="gap-1.5 font-heading"
+                    >
+                      Sync Pricing
+                    </SketchButton>
+                    <SketchButton
+                      variant="secondary"
+                      size="sm"
                       onClick={() => openEditProvider(activeProvider)}
                       className="gap-1.5 font-heading"
                     >
@@ -633,6 +1291,90 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                   </div>
                 </div>
 
+                <div className="mb-5 grid grid-cols-1 xl:grid-cols-2 gap-3">
+                  <div className="p-3 bg-[var(--paper)] border border-[var(--ink)] rounded text-xs font-mono">
+                    <strong className="font-heading text-sm block mb-2">Model lifecycle</strong>
+                    <div className="grid grid-cols-2 gap-2">
+                      <label>
+                        Reconcile interval (sec)
+                        <input
+                          type="number"
+                          min={0}
+                          value={lifecycleSettings?.reconciliation_interval_secs ?? 0}
+                          onChange={(e) =>
+                            setLifecycleSettings((current) =>
+                              current
+                                ? { ...current, reconciliation_interval_secs: Number(e.target.value) }
+                                : current,
+                            )
+                          }
+                          className="mt-1 w-full bg-[var(--surface)] border border-[var(--ink)] px-2 py-1 rounded"
+                        />
+                      </label>
+                      <label>
+                        Pricing sync interval (sec)
+                        <input
+                          type="number"
+                          min={0}
+                          value={lifecycleSettings?.pricing_sync_interval_secs ?? 0}
+                          onChange={(e) =>
+                            setLifecycleSettings((current) =>
+                              current
+                                ? { ...current, pricing_sync_interval_secs: Number(e.target.value) }
+                                : current,
+                            )
+                          }
+                          className="mt-1 w-full bg-[var(--surface)] border border-[var(--ink)] px-2 py-1 rounded"
+                        />
+                      </label>
+                    </div>
+                    <div className="mt-2 flex items-center justify-between gap-2">
+                      <span className="text-[var(--ink)]/60">0 disables scheduling; minimum enabled interval is 300s.</span>
+                      <button
+                        type="button"
+                        disabled={!lifecycleSettings || savingLifecycleSettings}
+                        onClick={handleSaveLifecycleSettings}
+                        className="px-2 py-1 border border-[var(--ink)] rounded font-heading font-bold hover:bg-[var(--erased)] disabled:opacity-50"
+                      >
+                        {savingLifecycleSettings ? 'Saving…' : 'Save schedule'}
+                      </button>
+                    </div>
+                  </div>
+                  <div className="p-3 bg-[var(--paper)] border border-[var(--ink)] rounded text-xs font-mono">
+                    <strong className="font-heading text-sm block mb-1">Lifecycle policy</strong>
+                    <div>Metadata reconciliation observes drift; it never silently changes configured model fields.</div>
+                    <div>Pricing sync preserves operator-owned prices and only adopts known upstream/catalog price fields.</div>
+                    <div>Capability probes are explicit, bounded, scoped, and expire after the configured freshness window.</div>
+                    {providerLifecycle && (
+                      <div className="mt-2 pt-2 border-t border-[var(--ink)]/20 space-y-1">
+                        <div>
+                          Reconcile · attempt {providerLifecycle.reconciliation.last_attempt ? new Date(providerLifecycle.reconciliation.last_attempt).toLocaleString() : '—'}
+                          {' · '}success {providerLifecycle.reconciliation.last_success ? new Date(providerLifecycle.reconciliation.last_success).toLocaleString() : '—'}
+                        </div>
+                        {providerLifecycle.reconciliation.last_error && (
+                          <div className="text-[var(--danger-text)]">
+                            Last reconciliation failure: {providerLifecycle.reconciliation.last_error}
+                          </div>
+                        )}
+                        <div>
+                          Pricing · attempt {providerLifecycle.pricing_sync.last_attempt ? new Date(providerLifecycle.pricing_sync.last_attempt).toLocaleString() : '—'}
+                          {' · '}success {providerLifecycle.pricing_sync.last_success ? new Date(providerLifecycle.pricing_sync.last_success).toLocaleString() : '—'}
+                        </div>
+                        {providerLifecycle.pricing_sync.last_error && (
+                          <div className="text-[var(--danger-text)]">
+                            Last pricing failure: {providerLifecycle.pricing_sync.last_error}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                    {lifecycleNotice && (
+                      <div className="mt-2 pt-2 border-t border-[var(--ink)]/20 text-[var(--pen-blue)]">
+                        {lifecycleNotice}
+                      </div>
+                    )}
+                  </div>
+                </div>
+
               {/* Model Discovery Results (if any) */}
               {discoveryResults && (
                 <div className="p-4 bg-[var(--postit)] border-2 border-[var(--ink)] sketch-shadow-sm mb-6 rounded-lg">
@@ -666,11 +1408,45 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                         className="bg-[var(--surface)] border-2 border-[var(--ink)] px-3 py-1.5 text-xs font-mono sketch-shadow-sm flex items-center gap-2 rounded"
                       >
                         <span className="font-bold">{m.id}</span>
+                        {m.canonical_model_id ? (
+                          <span className="text-[var(--ink)]/50">
+                            canonical: {m.canonical_model_id}
+                          </span>
+                        ) : null}
+                        {m.model_type ? (
+                          <span className="text-[var(--marker-red)]">
+                            type: {m.model_type}
+                          </span>
+                        ) : null}
                         {m.context_window ? (
                           <span className="text-[var(--ink)]/50">{m.context_window.toLocaleString()} ctx</span>
                         ) : null}
+                        {m.transport ? (
+                          <span className="text-[var(--pen-blue)]">transport: {m.transport}</span>
+                        ) : null}
+                        {m.reasoning_capability ? (
+                          <span className="text-[var(--pen-blue)]">
+                            reasoning:{' '}
+                            {m.capability_sources?.reasoning?.includes('plugin_capabilities_json')
+                              ? 'plugin-managed · '
+                              : ''}
+                            {m.provider_variant?.kind === 'reasoning_tier' && m.provider_variant.fixed
+                              ? (m.provider_variant.reasoning_level || m.provider_variant.id)
+                              : m.reasoning_capability.levels.join('/')}
+                          </span>
+                        ) : null}
+                        {m.capabilities?.vision ? (
+                          <span className="text-[var(--pen-blue)]">vision</span>
+                        ) : null}
+                        {m.capabilities?.tool_calling ? (
+                          <span className="text-[var(--pen-blue)]">tools</span>
+                        ) : null}
                         {m.already_imported ? (
                           <span className="text-[var(--pen-green)] font-bold">✓ imported</span>
+                        ) : m.execution_supported === false ? (
+                          <span className="text-[var(--marker-red)] font-bold">
+                            not executable
+                          </span>
                         ) : (
                           <button
                             onClick={() => handleImportDiscoveredModel(m)}
@@ -751,7 +1527,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                               </span>
                             </div>
                             <span className="text-xs font-mono text-[var(--ink)]/70">
-                              Context: {(m.contextWindow || DEFAULT_CONTEXT_WINDOW).toLocaleString()} tokens • Max Output: {m.maxOutputTokens || DEFAULT_MAX_OUTPUT}
+                              Context: {m.contextWindow?.toLocaleString() ?? 'unknown'} tokens • Max Output: {m.maxOutputTokens ?? 'unknown'}
                             </span>
                           </div>
 
@@ -762,6 +1538,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                               {m.capabilities.vision && <SketchBadge variant="blue">Vision</SketchBadge>}
                               {m.capabilities.reasoning && <SketchBadge variant="yellow">Reasoning</SketchBadge>}
                               {m.capabilities.toolCalling && <SketchBadge variant="green">Tools</SketchBadge>}
+                              {m.capabilities.structuredOutput && <SketchBadge variant="blue">Structured</SketchBadge>}
                             </div>
 
                             {confirmDeleteModelId === m.id ? (
@@ -806,18 +1583,329 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                           </div>
                         </div>
 
+                        {modelReconciliation(m) && (
+                          <div className="mb-3 p-3 bg-[var(--erased-soft)] border border-[var(--ink)]/40 rounded text-xs font-mono">
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <strong className="font-heading text-sm">Reconciliation</strong>
+                                <SketchBadge
+                                  variant={
+                                    modelReconciliation(m)?.status === 'changed' ||
+                                    modelReconciliation(m)?.status === 'missing' ||
+                                    modelReconciliation(m)?.status === 'deprecated'
+                                      ? 'yellow'
+                                      : modelReconciliation(m)?.status === 'unchanged' ||
+                                          modelReconciliation(m)?.status === 'accepted'
+                                        ? 'green'
+                                        : 'default'
+                                  }
+                                >
+                                  {modelReconciliation(m)?.status || 'unknown'}
+                                </SketchBadge>
+                                <span>
+                                  {modelReconciliation(m)?.diff?.length || 0} field(s) changed
+                                </span>
+                                {modelReconciliation(m)?.last_success_at && (
+                                  <span className="text-[var(--ink)]/60">
+                                    last success {new Date(modelReconciliation(m)!.last_success_at!).toLocaleString()}
+                                  </span>
+                                )}
+                              </div>
+                              {!!modelReconciliation(m)?.diff?.length && (
+                                <div className="flex flex-wrap gap-1">
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      setReconciliationSelections((current) => ({
+                                        ...current,
+                                        [m.id]: modelReconciliation(m)?.diff?.map((diff) => diff.field || '').filter(Boolean) || [],
+                                      }))
+                                    }
+                                    className="px-2 py-1 border border-[var(--ink)] rounded"
+                                  >
+                                    Select all
+                                  </button>
+                                  <button
+                                    type="button"
+                                    disabled={
+                                      lifecycleBusy === `accept:${m.id}`
+                                      || !(reconciliationSelections[m.id]?.length)
+                                    }
+                                    onClick={() =>
+                                      handleReconciliationAction(
+                                        m.id,
+                                        'accept',
+                                        reconciliationSelections[m.id] || [],
+                                      )
+                                    }
+                                    className="px-2 py-1 border border-[var(--pen-green)] text-[var(--pen-green)] rounded font-bold disabled:opacity-40"
+                                  >
+                                    Accept selected
+                                  </button>
+                                  <button
+                                    type="button"
+                                    disabled={lifecycleBusy === `ignore:${m.id}`}
+                                    onClick={() => handleReconciliationAction(m.id, 'ignore')}
+                                    className="px-2 py-1 border border-[var(--ink)] rounded font-bold"
+                                  >
+                                    Ignore
+                                  </button>
+                                  <button
+                                    type="button"
+                                    disabled={
+                                      lifecycleBusy === `pin:${m.id}`
+                                      || !(reconciliationSelections[m.id]?.length)
+                                    }
+                                    onClick={() =>
+                                      handleReconciliationAction(
+                                        m.id,
+                                        'pin',
+                                        reconciliationSelections[m.id] || [],
+                                      )
+                                    }
+                                    className="px-2 py-1 border border-[var(--pen-blue)] text-[var(--pen-blue)] rounded font-bold disabled:opacity-40"
+                                  >
+                                    Pin selected
+                                  </button>
+                                </div>
+                              )}
+                            </div>
+                            {modelReconciliation(m)?.deprecation && (
+                              <div className="mt-2 text-[var(--marker-red)]">
+                                deprecated via {modelReconciliation(m)?.deprecation?.source || 'unknown source'}
+                                {modelReconciliation(m)?.deprecation?.effective_date !== undefined
+                                  ? ` · effective ${formatDriftValue(modelReconciliation(m)?.deprecation?.effective_date)}`
+                                  : ''}
+                                {modelReconciliation(m)?.deprecation?.end_date !== undefined
+                                  ? ` · end ${formatDriftValue(modelReconciliation(m)?.deprecation?.end_date)}`
+                                  : ''}
+                                {modelReconciliation(m)?.deprecation?.replacement !== undefined
+                                  ? ` · replacement ${formatDriftValue(modelReconciliation(m)?.deprecation?.replacement)}`
+                                  : ''}
+                              </div>
+                            )}
+                            {!!modelReconciliation(m)?.diff?.length && (
+                              <div className="mt-3 space-y-2">
+                                {modelReconciliation(m)?.diff?.map((diff) => {
+                                  const selected = reconciliationSelections[m.id]?.includes(diff.field || '') || false;
+                                  return (
+                                    <label
+                                      key={diff.field}
+                                      className="block p-2 bg-[var(--surface)] border border-[var(--ink)]/30 rounded cursor-pointer"
+                                    >
+                                      <div className="flex items-center gap-2 font-bold">
+                                        <input
+                                          type="checkbox"
+                                          checked={selected}
+                                          onChange={() =>
+                                            setReconciliationSelections((current) => {
+                                              const existing = current[m.id] || [];
+                                              const field = diff.field || '';
+                                              const next = existing.includes(field)
+                                                ? existing.filter((candidate) => candidate !== field)
+                                                : [...existing, field];
+                                              return { ...current, [m.id]: next };
+                                            })
+                                          }
+                                        />
+                                        <span>Δ {diff.field}</span>
+                                      </div>
+                                      <div className="mt-1 grid grid-cols-1 lg:grid-cols-3 gap-2 text-[var(--ink)]/70">
+                                        <div>
+                                          <strong>Configured</strong>
+                                          <pre className="whitespace-pre-wrap break-all">{formatDriftValue(diff.configured)}</pre>
+                                        </div>
+                                        <div>
+                                          <strong>Observed</strong>
+                                          <pre className="whitespace-pre-wrap break-all">{formatDriftValue(diff.observed)}</pre>
+                                        </div>
+                                        <div>
+                                          <strong>Source</strong>
+                                          <pre className="whitespace-pre-wrap break-all">{formatDriftValue(diff.source)}</pre>
+                                        </div>
+                                      </div>
+                                    </label>
+                                  );
+                                })}
+                              </div>
+                            )}
+                          </div>
+                        )}
+
+                        <div className="mb-3 p-3 bg-[var(--paper)] border border-[var(--ink)]/40 rounded text-xs font-mono">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div>
+                              <strong className="font-heading text-sm">Verified capability probes</strong>
+                              <span className="ml-2 text-[var(--ink)]/60">
+                                transport {probeEvidenceSummary(m, 'transport', selectedProbeAccountId(m.providerId))} ·
+                                reasoning efforts {
+                                  Object.keys(modelProbeEvidence(m))
+                                    .filter((key) => key.startsWith('reasoning_effort_'))
+                                    .map((key) =>
+                                      `${key.replace('reasoning_effort_', '')}:${probeEvidenceSummary(
+                                        m,
+                                        key,
+                                        selectedProbeAccountId(m.providerId),
+                                      )}`,
+                                    )
+                                    .join(', ') || '—'
+                                } ·
+                                tools {probeEvidenceSummary(m, 'tool_calling', selectedProbeAccountId(m.providerId))} ·
+                                structured {probeEvidenceSummary(m, 'structured_output', selectedProbeAccountId(m.providerId))}
+                              </span>
+                            </div>
+                            <div className="flex flex-wrap items-center gap-2 text-[var(--ink)]/70">
+                              <label className="flex items-center gap-1">
+                                Probe account
+                                <select
+                                  value={selectedProbeAccountId(m.providerId)}
+                                  onChange={(event) =>
+                                    setProbeAccountByProvider((current) => ({
+                                      ...current,
+                                      [m.providerId]: event.target.value,
+                                    }))
+                                  }
+                                  className="bg-[var(--surface)] border border-[var(--ink)] px-2 py-1 rounded"
+                                >
+                                  {probeAccountsForProvider(m.providerId).map((account) => (
+                                    <option key={account.id} value={account.id}>
+                                      {account.label} · {account.status}
+                                    </option>
+                                  ))}
+                                </select>
+                              </label>
+                              <label className="flex items-center gap-1">
+                                Probe transport
+                                <input
+                                  type="text"
+                                  value={probeTransportInputValue(m)}
+                                  onChange={(event) =>
+                                    setProbeTransportByModel((current) => ({
+                                      ...current,
+                                      [m.id]: event.target.value,
+                                    }))
+                                  }
+                                  placeholder={modelProbeTransport(m, activeProvider)}
+                                  className="w-44 bg-[var(--surface)] border border-[var(--ink)] px-2 py-1 rounded font-mono"
+                                />
+                              </label>
+                              <span>
+                                Target: {activeProvider.name} / {selectedProbeAccount(m.providerId)?.label || 'no account'} / {m.upstreamModelId} / {selectedProbeTransport(m)}
+                              </span>
+                              <span>
+                                Safety: {PROBE_MAX_REQUESTS} request · max cost ${PROBE_MAX_COST_USD.toFixed(2)}
+                              </span>
+                            </div>
+                            <div className="flex flex-wrap gap-1">
+                              {(['transport', 'tool_calling', 'structured_output'] as const).map((capability) => {
+                                const key = probeStatusKey(m, capability);
+                                return (
+                                  <button
+                                    key={key}
+                                    type="button"
+                                    disabled={
+                                      lifecycleBusy === `probe:${key}`
+                                      || !selectedProbeAccountId(m.providerId)
+                                    }
+                                    onClick={() => handleProbeModel(m, capability)}
+                                    className="px-2 py-1 border border-[var(--ink)] rounded hover:bg-[var(--erased)]"
+                                  >
+                                    Probe {capability.replace('_', ' ')}
+                                    {probeStatus[key] ? ` · ${probeStatus[key]}` : ''}
+                                  </button>
+                                );
+                              })}
+                              {modelReasoningLevels(m).map((level) => {
+                                const key = probeStatusKey(m, 'reasoning', level);
+                                return (
+                                  <button
+                                    key={key}
+                                    type="button"
+                                    disabled={
+                                      lifecycleBusy === `probe:${key}`
+                                      || !selectedProbeAccountId(m.providerId)
+                                    }
+                                    onClick={() => handleProbeModel(m, 'reasoning', level)}
+                                    className="px-2 py-1 border border-[var(--ink)] rounded hover:bg-[var(--erased)]"
+                                  >
+                                    Probe reasoning {level}
+                                    {probeStatus[key] ? ` · ${probeStatus[key]}` : ''}
+                                  </button>
+                                );
+                              })}
+                              {modelCanProbeReasoningDisable(m, activeProvider) && (() => {
+                                const key = probeStatusKey(m, 'reasoning_disable', 'off');
+                                return (
+                                  <button
+                                    type="button"
+                                    disabled={
+                                      lifecycleBusy === `probe:${key}`
+                                      || !selectedProbeAccountId(m.providerId)
+                                    }
+                                    onClick={() => handleProbeModel(m, 'reasoning_disable', 'off')}
+                                    className="px-2 py-1 border border-[var(--ink)] rounded hover:bg-[var(--erased)]"
+                                  >
+                                    Probe reasoning off
+                                    {probeStatus[key] ? ` · ${probeStatus[key]}` : ''}
+                                  </button>
+                                );
+                              })()}
+                            </div>
+                          </div>
+                        </div>
+
                         {/* Prices & Parameter policies */}
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs font-mono">
                           <div className="bg-[var(--paper)] p-2 border border-[var(--ink)] rounded">
-                            <strong className="font-heading text-sm text-[var(--ink)] block mb-1">
-                              💵 Token Pricing (Admin Defined)
-                            </strong>
-                            <div>Input: ${m.prices.inputPer1M} / 1M</div>
-                            <div>Output: ${m.prices.outputPer1M} / 1M</div>
-                            <div>Cached: ${m.prices.cachedPer1M} / 1M</div>
-                            {m.capabilities.reasoning && (
-                              <div>Thinking: ${m.prices.thinkingPer1M} / 1M</div>
-                            )}
+                            {(() => {
+                              const pricing = modelPricingDetails(m);
+                              const rows: Array<{ field: PricingField; label: string }> = [
+                                { field: 'input_per_1m', label: 'Input' },
+                                { field: 'output_per_1m', label: 'Output' },
+                                { field: 'cached_per_1m', label: 'Cache read' },
+                                { field: 'cache_write_per_1m', label: 'Cache write' },
+                                { field: 'thinking_per_1m', label: 'Thinking' },
+                              ];
+                              const sourceState = pricing.observation.catalog?.source_state;
+                              return (
+                                <>
+                                  <strong className="font-heading text-sm text-[var(--ink)] block mb-2">
+                                    💵 Token Pricing
+                                  </strong>
+                                  <div className="grid grid-cols-[minmax(5rem,0.8fr)_minmax(0,1fr)_minmax(0,1fr)] gap-x-2 gap-y-1">
+                                    <div className="font-bold">Field</div>
+                                    <div className="font-bold">Effective</div>
+                                    <div className="font-bold">Latest observed</div>
+                                    {rows.map((row) => {
+                                      const effective = effectivePricingCell(m, pricing, row.field);
+                                      return (
+                                        <React.Fragment key={row.field}>
+                                          <div>{row.label}</div>
+                                          <div>
+                                            {formatPricingValue(effective.value)}
+                                            {effective.fallback ? ` · ${effective.fallback}` : ''}
+                                            <span className="block text-[var(--ink)]/55">
+                                              {effective.source}
+                                            </span>
+                                          </div>
+                                          <div>
+                                            {formatPricingValue(pricing.observation.prices?.[row.field])}
+                                            <span className="block text-[var(--ink)]/55">
+                                              {pricing.observation.price_sources?.[row.field] || 'untracked'}
+                                            </span>
+                                          </div>
+                                        </React.Fragment>
+                                      );
+                                    })}
+                                  </div>
+                                  <div className="mt-2 pt-2 border-t border-[var(--ink)]/20 text-[var(--ink)]/70">
+                                    Catalog: {sourceState?.freshness || 'unknown'}
+                                    {' · '}retrieved {formatPricingTimestamp(sourceState?.retrieved_at)}
+                                    {sourceState?.source ? ` · ${sourceState.source}` : ''}
+                                  </div>
+                                </>
+                              );
+                            })()}
                           </div>
 
                           <div className="bg-[var(--paper)] p-2 border border-[var(--ink)] rounded">
@@ -825,13 +1913,34 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                               ⚙️ Parameter & Thinking Controls
                             </strong>
                             <div>Temperature Policy: <strong>Clamp (0.0 - 2.0)</strong></div>
-                            <div>
-                              Thinking Scale:{' '}
-                              <strong className="text-[var(--pen-blue)]">{m.thinkingMap.scale}</strong>
-                            </div>
-                            <div className="truncate">
-                              Mapped Field: <code>{m.thinkingMap.mappedField}</code>
-                            </div>
+                            {pluginManagedReasoning(m) ? (
+                              <>
+                                <div>
+                                  Reasoning: <strong className="text-[var(--pen-blue)]">Plugin-managed</strong>
+                                  {pluginManagedReasoning(m)?.variant?.fixed
+                                    ? ` · ${pluginManagedReasoning(m)?.variant?.reasoning_level || pluginManagedReasoning(m)?.variant?.id || ''}`
+                                    : ''}
+                                </div>
+                                <div>
+                                  Supported:{' '}
+                                  <strong className="text-[var(--pen-blue)]">
+                                    {pluginManagedReasoning(m)?.capability?.levels?.join(' / ') || 'provider-defined'}
+                                  </strong>
+                                </div>
+                              </>
+                            ) : (
+                              <>
+                                <div>
+                                  Thinking Levels:{' '}
+                                  <strong className="text-[var(--pen-blue)]">
+                                    {Object.keys(m.thinkingMap.levels).sort().join(', ') || 'none'}
+                                  </strong>
+                                </div>
+                                <div className="truncate">
+                                  Budget Field: <code>{m.thinkingMap.budgetField || '—'}</code>
+                                </div>
+                              </>
+                            )}
                           </div>
                         </div>
                       </div>
@@ -1212,6 +2321,23 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
 
                 <div>
                   <label className="block text-sm font-heading font-bold text-[var(--ink)] mb-1">
+                    Execution Transport Override
+                  </label>
+                  <input
+                    type="text"
+                    placeholder="leave blank for discovery/provider default"
+                    value={modelTransportOverride}
+                    onChange={(e) => setModelTransportOverride(e.target.value)}
+                    className="w-full bg-[var(--surface)] border-2 border-[var(--ink)] px-3 py-2 text-base font-mono sketch-shadow-sm focus:outline-none"
+                    style={{ borderRadius: DESIGN_TOKENS.radii.wobblyMd }}
+                  />
+                  <p className="text-xs font-body text-[var(--ink)]/60 mt-1">
+                    Use openai, openai-responses, anthropic, gemini, or a plugin:&lt;id&gt;/&lt;adapter&gt; reference. Blank keeps discovery/provider defaults.
+                  </p>
+                </div>
+
+                <div>
+                  <label className="block text-sm font-heading font-bold text-[var(--ink)] mb-1">
                     Display Name
                   </label>
                   <input
@@ -1256,38 +2382,38 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                 </div>
 
                 <p className="text-xs font-body text-[var(--ink)]/60">
-                  If a value is unknown, leave it as 0 (or blank) to apply the defaults:{' '}
-                  {DEFAULT_CONTEXT_WINDOW.toLocaleString()} context window · {DEFAULT_MAX_OUTPUT.toLocaleString()} max output.
+                  New manual models use {DEFAULT_CONTEXT_WINDOW.toLocaleString()} context ·{' '}
+                  {DEFAULT_MAX_OUTPUT.toLocaleString()} max output when blank. Imported models keep blank values unknown.
                 </p>
 
                 {/* Token Pricing */}
                 <div className="grid grid-cols-2 gap-3 bg-[var(--erased-soft)] p-3 border border-[var(--ink)] rounded">
-                  <div>
-                    <label className="block text-xs font-heading font-bold text-[var(--ink)] mb-1">
-                      Input Price ($ / 1M)
-                    </label>
-                    <input
-                      type="number"
-                      step={0.01}
-                      min={0}
-                      value={modelInputPrice}
-                      onChange={(e) => setModelInputPrice(Number(e.target.value))}
-                      className="w-full bg-[var(--surface)] border border-[var(--ink)] px-2 py-1 text-sm font-mono focus:outline-none rounded"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-xs font-heading font-bold text-[var(--ink)] mb-1">
-                      Output Price ($ / 1M)
-                    </label>
-                    <input
-                      type="number"
-                      step={0.01}
-                      min={0}
-                      value={modelOutputPrice}
-                      onChange={(e) => setModelOutputPrice(Number(e.target.value))}
-                      className="w-full bg-[var(--surface)] border border-[var(--ink)] px-2 py-1 text-sm font-mono focus:outline-none rounded"
-                    />
-                  </div>
+                  {([
+                    ['Input Price ($ / 1M)', modelInputPrice, setModelInputPrice],
+                    ['Output Price ($ / 1M)', modelOutputPrice, setModelOutputPrice],
+                    ['Cache Read ($ / 1M)', modelCachedPrice, setModelCachedPrice],
+                    ['Cache Write ($ / 1M)', modelCacheWritePrice, setModelCacheWritePrice],
+                    ['Thinking ($ / 1M)', modelThinkingPrice, setModelThinkingPrice],
+                  ] as const).map(([label, value, setter]) => (
+                    <div key={String(label)}>
+                      <label className="block text-xs font-heading font-bold text-[var(--ink)] mb-1">
+                        {String(label)}
+                      </label>
+                      <input
+                        type="number"
+                        step="any"
+                        min={0}
+                        value={value ?? ''}
+                        placeholder="unknown"
+                        onChange={(e) =>
+                          (setter as React.Dispatch<React.SetStateAction<number | null>>)(
+                            e.target.value === '' ? null : Number(e.target.value),
+                          )
+                        }
+                        className="w-full bg-[var(--surface)] border border-[var(--ink)] px-2 py-1 text-sm font-mono focus:outline-none rounded"
+                      />
+                    </div>
+                  ))}
                 </div>
 
                 {/* Capabilities */}
@@ -1299,7 +2425,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                     <label className="flex items-center gap-2 cursor-pointer">
                       <input
                         type="checkbox"
-                        checked={capText}
+                        checked={capText ?? false}
                         onChange={(e) => setCapText(e.target.checked)}
                         className="w-4 h-4 accent-[var(--marker-red)]"
                       />
@@ -1308,7 +2434,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                     <label className="flex items-center gap-2 cursor-pointer">
                       <input
                         type="checkbox"
-                        checked={capVision}
+                        checked={capVision ?? false}
                         onChange={(e) => setCapVision(e.target.checked)}
                         className="w-4 h-4 accent-[var(--marker-red)]"
                       />
@@ -1317,7 +2443,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                     <label className="flex items-center gap-2 cursor-pointer">
                       <input
                         type="checkbox"
-                        checked={capReasoning}
+                        checked={capReasoning ?? false}
                         onChange={(e) => setCapReasoning(e.target.checked)}
                         className="w-4 h-4 accent-[var(--marker-red)]"
                       />
@@ -1326,14 +2452,105 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                     <label className="flex items-center gap-2 cursor-pointer">
                       <input
                         type="checkbox"
-                        checked={capTools}
+                        checked={capTools ?? false}
                         onChange={(e) => setCapTools(e.target.checked)}
                         className="w-4 h-4 accent-[var(--marker-red)]"
                       />
-                      <span>Tool Calling / JSON</span>
+                      <span>Tool Calling</span>
+                    </label>
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={capStructuredOutput ?? false}
+                        onChange={(e) => setCapStructuredOutput(e.target.checked)}
+                        className="w-4 h-4 accent-[var(--marker-red)]"
+                      />
+                      <span>Structured Output / JSON</span>
                     </label>
                   </div>
                 </div>
+
+                {capReasoning && (
+                  <details className="bg-[var(--erased-soft)] p-3 border border-[var(--ink)] rounded">
+                    <summary className="cursor-pointer text-sm font-heading font-bold text-[var(--ink)]">
+                      Advanced / Override reasoning mapping
+                    </summary>
+                    <div className="space-y-3 mt-3">
+                    <div>
+                      <label className="block text-sm font-heading font-bold text-[var(--ink)] mb-1">
+                        Canonical Thinking Map
+                      </label>
+                      <p className="text-xs font-body text-[var(--ink)]/70">
+                        Configure canonical levels as JSON objects, or scalar values sent under the field for the selected reasoning mode.
+                      </p>
+                    </div>
+                    <div>
+                      <label className="block text-xs font-heading font-bold text-[var(--ink)] mb-1">
+                        Thinking Mode
+                      </label>
+                      <select
+                        value={modelThinkingMode}
+                        onChange={(e) => setModelThinkingMode(e.target.value as '' | 'manual_budget' | 'level' | 'adaptive')}
+                        className="w-full bg-[var(--surface)] border border-[var(--ink)] px-2 py-1.5 text-sm font-mono focus:outline-none rounded"
+                      >
+                        <option value="">Legacy / inferred</option>
+                        <option value="manual_budget">Manual budget</option>
+                        <option value="level">Level / effort</option>
+                        <option value="adaptive">Adaptive thinking</option>
+                      </select>
+                    </div>
+                    <div className="grid grid-cols-1 gap-2">
+                      {thinkingLevelInputs.map(([level, value, setter]) => (
+                        <div key={level}>
+                          <label className="block text-xs font-heading font-bold text-[var(--ink)] mb-1 capitalize">
+                            {level}
+                          </label>
+                          <input
+                            type="text"
+                            value={value}
+                            onChange={(e) => setter(e.target.value)}
+                            placeholder={`{"reasoning_effort":"${level}"} or numeric budget`}
+                            className="w-full bg-[var(--surface)] border border-[var(--ink)] px-2 py-1.5 text-sm font-mono focus:outline-none rounded"
+                          />
+                        </div>
+                      ))}
+                    </div>
+                    {modelThinkingMode === 'level' || modelThinkingMode === 'adaptive' ? (
+                      <div>
+                        <label className="block text-xs font-heading font-bold text-[var(--ink)] mb-1">
+                          Level Field
+                        </label>
+                        <input
+                          type="text"
+                          value={modelThinkingLevelField}
+                          onChange={(e) => setModelThinkingLevelField(e.target.value)}
+                          placeholder="e.g. output_config.effort"
+                          className="w-full bg-[var(--surface)] border border-[var(--ink)] px-2 py-1.5 text-sm font-mono focus:outline-none rounded"
+                        />
+                        <p className="text-xs font-body text-[var(--ink)]/60 mt-1">
+                          Scalar adaptive levels are written here; Anthropic adaptive thinking never emits budget_tokens.
+                        </p>
+                      </div>
+                    ) : (
+                      <div>
+                        <label className="block text-xs font-heading font-bold text-[var(--ink)] mb-1">
+                          Budget Field (optional)
+                        </label>
+                        <input
+                          type="text"
+                          value={modelThinkingBudgetField}
+                          onChange={(e) => setModelThinkingBudgetField(e.target.value)}
+                          placeholder="e.g. thinking.budget_tokens"
+                          className="w-full bg-[var(--surface)] border border-[var(--ink)] px-2 py-1.5 text-sm font-mono focus:outline-none rounded"
+                        />
+                        <p className="text-xs font-body text-[var(--ink)]/60 mt-1">
+                          Used when a legacy/manual level mapping is a scalar. Object mappings can use dotted field paths directly.
+                        </p>
+                      </div>
+                    )}
+                    </div>
+                  </details>
+                )}
 
                 <div className="pt-2 flex justify-end gap-3">
                   <SketchButton

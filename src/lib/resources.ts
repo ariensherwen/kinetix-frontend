@@ -27,12 +27,184 @@ export interface CreateKeyInput {
   monthly_budget?: number | null;
 }
 
+export type ClientProfileClient = 'pi' | 'claude_code' | 'codex' | 'open_code';
+
+export interface ClientProfileModel {
+  id: string;
+}
+
+export interface ClientProfileFile {
+  filename: string;
+  destination: string | null;
+  content_type: string;
+  content: string;
+}
+
+export interface GeneratedClientProfile {
+  client: ClientProfileClient;
+  model: string;
+  public_base_url: string;
+  files: ClientProfileFile[];
+}
+
+export interface DiscoveredReasoningCapability {
+  mode?: 'toggle' | 'manual_budget' | 'level' | 'adaptive' | null;
+  levels: string[];
+  default?: string | null;
+  can_disable: boolean;
+  upstream_format: string;
+}
+
+export interface DiscoveredThinkingMap {
+  levels: Record<string, unknown>;
+  mode?: 'manual_budget' | 'level' | 'adaptive' | null;
+  budget_field?: string | null;
+  level_field?: string | null;
+}
+
 export interface DiscoveredModel {
   id: string;
   display_name?: string | null;
   context_window?: number | null;
   max_output_tokens?: number | null;
+  capabilities?: {
+    text?: boolean | null;
+    reasoning?: boolean | null;
+    vision?: boolean | null;
+    tool_calling?: boolean | null;
+    structured_output?: boolean | null;
+  } | null;
+  reasoning_capability?: DiscoveredReasoningCapability | null;
+  thinking_map?: DiscoveredThinkingMap | null;
+  transport?: string | null;
+  transport_source?: string | null;
+  capability_sources?: Record<string, string | null> | null;
+  modalities?: {
+    input?: string[] | null;
+    output?: string[] | null;
+  } | null;
+  prices?: {
+    input_per_1m?: number | null;
+    output_per_1m?: number | null;
+    cached_per_1m?: number | null;
+    cache_write_per_1m?: number | null;
+    thinking_per_1m?: number | null;
+  } | null;
+  price_sources?: Record<string, string | null> | null;
+  raw_metadata?: unknown | null;
+  raw_metadata_truncated?: boolean;
+  canonical_identity?: {
+    status: 'resolved' | 'ambiguous' | 'unresolved';
+    upstream_model_id: string;
+    canonical_model_id?: string | null;
+    match?: string | null;
+    source?: string | null;
+    candidates?: string[];
+  } | null;
+  canonical_model_id?: string | null;
+  canonical_match?: string | null;
+  provider_variant?: {
+    kind: 'reasoning_tier' | 'provider_alias' | 'thinking_variant';
+    id: string;
+    reasoning_level?: string | null;
+    fixed: boolean;
+  } | null;
+  opaque_state?: {
+    kind: 'gemini_thought_signature';
+    family: string;
+    encoding_version: number;
+    placeholder_strategy?: 'gemini3_skip_validator' | null;
+  } | null;
+  model_type?: string | null;
+  execution_supported?: boolean;
+  catalog?: {
+    canonical?: {
+      source?: string | null;
+      reference?: string | null;
+      canonical_model_id?: string | null;
+      url?: string | null;
+      model_type?: string | null;
+      max_input_tokens?: number | null;
+      metadata?: unknown;
+    } | null;
+    provider?: {
+      source?: string | null;
+      reference?: string | null;
+      provider_id?: string | null;
+      model_id?: string | null;
+      url?: string | null;
+      model_type?: string | null;
+      max_input_tokens?: number | null;
+      metadata?: unknown;
+    } | null;
+  } | null;
+  reconciliation?: ModelReconciliation | null;
   already_imported: boolean;
+}
+
+export interface ReconciliationDiff {
+  field: string;
+  configured: unknown;
+  observed: unknown;
+  source?: unknown;
+}
+
+export interface ModelReconciliation {
+  status: 'new' | 'unchanged' | 'changed' | 'ignored' | 'missing' | 'deprecated' | 'accepted' | string;
+  checked_at?: string | null;
+  last_success_at?: string | null;
+  diff?: ReconciliationDiff[];
+  pinned_fields?: string[];
+}
+
+export interface ModelLifecycleSettings {
+  reconciliation_interval_secs: number;
+  pricing_sync_interval_secs: number;
+  jitter_secs: number;
+  probe_freshness_secs: number;
+}
+
+export interface LifecycleLaneStatus {
+  last_attempt?: string | null;
+  last_success?: string | null;
+  last_failure?: string | null;
+  last_error?: string | null;
+}
+
+export interface ProviderLifecycleStatus {
+  reconciliation: LifecycleLaneStatus;
+  pricing_sync: LifecycleLaneStatus;
+}
+
+export interface CachedDiscoveryResponse {
+  models: DiscoveredModel[];
+  disappeared: unknown[];
+  lifecycle: ProviderLifecycleStatus;
+}
+
+export interface CapabilityProbeResult {
+  status: 'supported' | 'unsupported' | 'inconclusive';
+  reason?: string;
+  transport?: string;
+  scope?: {
+    provider_id: string;
+    account_id: string;
+    model_id: string;
+    transport: string;
+  };
+  evidence?: {
+    status: string;
+    verified_at?: string;
+    fresh_until?: string;
+    estimated_max_cost_usd?: number;
+    detail?: string | null;
+    scope?: {
+      provider_id: string;
+      account_id: string;
+      model_id: string;
+      transport: string;
+    };
+  };
 }
 
 export interface TestResult {
@@ -74,6 +246,9 @@ export interface PluginCatalogEntry {
   installable: boolean;
   install_ready?: boolean;
   trust_status?: 'trusted' | 'unavailable' | 'discovery_only' | string;
+  installed?: boolean;
+  installed_version?: string | null;
+  update_available?: boolean;
   distribution?: {
     url: string;
     sha256: string;
@@ -109,6 +284,7 @@ export interface PluginIntegration {
   provider_adapter?: string | null;
   credential_strategy?: string | null;
   auth_flow?: string | null;
+  credential_mode?: 'manual' | 'auth_flow' | 'none' | null;
   model_source?: string | null;
   provider?: PluginIntegrationProvider | null;
 }
@@ -249,7 +425,8 @@ export interface PluginDetail extends PluginSummary {
 }
 
 export interface PluginInstallInput {
-  package_base64: string;
+  package_base64?: string;
+  url?: string;
   sha256?: string;
   trusted_keys?: string[];
   allow_untrusted_signature?: boolean;
@@ -272,6 +449,21 @@ export const RealKinetix = {
   logout: () => api.post<{ ok: boolean }>('/admin/api/logout'),
   changePassword: (current_password: string, new_password: string) =>
     api.post<{ ok: boolean; note: string }>('/admin/api/password', { current_password, new_password }),
+
+  publicBaseUrl: () =>
+    api.get<{ public_base_url: string; source: 'dashboard' | 'environment'; environment_default: string }>(
+      '/admin/api/settings/public-base-url',
+    ),
+  updatePublicBaseUrl: (public_base_url: string) =>
+    api.put<{ ok: boolean; public_base_url: string; source: 'dashboard' }>(
+      '/admin/api/settings/public-base-url',
+      { public_base_url },
+    ),
+
+  modelLifecycleSettings: () =>
+    api.get<ModelLifecycleSettings>('/admin/api/settings/model-lifecycle'),
+  updateModelLifecycleSettings: (body: Partial<ModelLifecycleSettings>) =>
+    api.put<ModelLifecycleSettings & { ok: boolean }>('/admin/api/settings/model-lifecycle', body),
 
   // --- usage exports -------------------------------------------------------
   async exports(): Promise<{ dir: string; retention_days: number; files: ExportFile[]; days: UsageDay[] }> {
@@ -296,6 +488,14 @@ export const RealKinetix = {
   },
   updateKey: (id: string, body: Record<string, unknown>) => api.put(`/admin/api/keys/${id}`, body),
   deleteKey: (id: string) => api.del(`/admin/api/keys/${id}`),
+  clientProfileModels: (keyId: string) =>
+    api.get<{ models: ClientProfileModel[] }>(`/admin/api/keys/${encodeURIComponent(keyId)}/client-profile-models`),
+  generateClientProfile: (body: {
+    key_id: string;
+    client: ClientProfileClient;
+    model: string;
+    api_key?: string;
+  }) => api.post<GeneratedClientProfile>('/admin/api/client-profiles/generate', body),
 
   // --- providers -----------------------------------------------------------
   async providers(): Promise<Provider[]> {
@@ -313,10 +513,22 @@ export const RealKinetix = {
       '/admin/api/validate/provider',
       body,
     ),
+  cachedDiscovery: (providerId: string) =>
+    api.get<CachedDiscoveryResponse>(`/admin/api/providers/${providerId}/discover`),
   async discover(providerId: string): Promise<DiscoveredModel[]> {
     const r = await api.post<{ models: DiscoveredModel[] }>(`/admin/api/providers/${providerId}/discover`);
     return r.models;
   },
+  reconcileProvider: (providerId: string) =>
+    api.post<{ models: DiscoveredModel[]; disappeared: unknown[]; lifecycle: ProviderLifecycleStatus }>(
+      `/admin/api/providers/${providerId}/reconcile`,
+      {},
+    ),
+  syncProviderPricing: (providerId: string) =>
+    api.post<{ ok: boolean; updated: string[]; skipped_manual: string[]; lifecycle: ProviderLifecycleStatus }>(
+      `/admin/api/providers/${providerId}/pricing/sync`,
+      {},
+    ),
   test: (providerId: string, model: string) =>
     api.post<TestResult>(`/admin/api/providers/${providerId}/test`, { model }),
 
@@ -328,6 +540,23 @@ export const RealKinetix = {
   createModel: (providerId: string, body: Record<string, unknown>) =>
     api.post(`/admin/api/providers/${providerId}/models`, body),
   updateModel: (id: string, body: Record<string, unknown>) => api.put(`/admin/api/models/${id}`, body),
+  reconcileModel: (id: string, action: 'accept' | 'ignore' | 'pin', fields: string[] = []) =>
+    api.put<{ ok: boolean }>(`/admin/api/models/${id}/reconciliation`, { action, fields }),
+  probeModel: (
+    id: string,
+    capability: string,
+    value?: unknown,
+    max_cost_usd?: number,
+    account_id?: string,
+    transport?: string,
+  ) =>
+    api.post<CapabilityProbeResult>(`/admin/api/models/${id}/probe`, {
+      capability,
+      ...(value === undefined ? {} : { value }),
+      ...(max_cost_usd === undefined ? {} : { max_cost_usd }),
+      ...(account_id === undefined ? {} : { account_id }),
+      ...(transport === undefined ? {} : { transport }),
+    }),
   deleteModel: (id: string) => api.del(`/admin/api/models/${id}`),
 
   // --- accounts ------------------------------------------------------------
@@ -345,9 +574,22 @@ export const RealKinetix = {
     return api.post<{ valid: boolean; problems: string[] }>('/admin/api/validate/account', body);
   },
   createAccount: (body: Record<string, unknown>) => api.post('/admin/api/accounts', body),
+  startProviderCredentialEnrollment: (providerId: string) =>
+    api.post<{
+      authorize_url: string;
+      redirect_uri: string;
+      state: string;
+      expires_in_secs: number;
+      manual_callback_supported: boolean;
+    }>(
+      `/admin/api/providers/${encodeURIComponent(providerId)}/credential-enrollment/start`,
+      {},
+    ),
   updateAccount: (id: string, body: Record<string, unknown>) => api.put(`/admin/api/accounts/${id}`, body),
   deleteAccount: (id: string) => api.del(`/admin/api/accounts/${id}`),
   resetAccount: (id: string) => api.post(`/admin/api/accounts/${id}/reset`),
+  testAccount: (id: string, model?: string) =>
+    api.post<TestResult>(`/admin/api/accounts/${id}/test`, model ? { model } : {}),
 
   // --- routes --------------------------------------------------------------
   async routes(): Promise<Route[]> {
@@ -386,8 +628,19 @@ export const RealKinetix = {
     const r = await api.get<{ plugins: PluginSummary[] }>('/admin/api/plugins');
     return r.plugins;
   },
-  pluginCatalog: () =>
-    api.get<PluginCatalogResponse>('/admin/api/plugins/catalog'),
+  pluginCatalog: (params?: { q?: string; capability?: string; refresh?: boolean }) => {
+    const sp = new URLSearchParams();
+    if (params?.q) sp.set('q', params.q);
+    if (params?.capability) sp.set('capability', params.capability);
+    if (params?.refresh) sp.set('refresh', 'true');
+    const qs = sp.toString();
+    return api.get<PluginCatalogResponse>(`/admin/api/plugins/catalog${qs ? `?${qs}` : ''}`);
+  },
+  refreshPluginCatalog: () =>
+    api.post<{ schema_version: number; count: number; refreshed: boolean }>(
+      '/admin/api/plugins/catalog/refresh',
+      {},
+    ),
   previewCatalogPlugin: (id: string) =>
     api.get<PluginCatalogPreview>(
       `/admin/api/plugins/catalog/${encodeURIComponent(id)}/preview`,
@@ -418,9 +671,24 @@ export const RealKinetix = {
       `/admin/api/plugins/${encodeURIComponent(pluginId)}/integrations/${encodeURIComponent(integrationId)}/provider`,
     ),
   startPluginAuth: (plugin_id: string, flow_name: string, provider_id: string) =>
-    api.post<{ authorize_url: string; state: string; expires_in_secs: number }>(
+    api.post<{
+      authorize_url: string;
+      redirect_uri: string;
+      state: string;
+      expires_in_secs: number;
+      manual_callback_supported: boolean;
+    }>(
       '/admin/api/plugins/auth/start',
       { plugin_id, flow_name, provider_id },
+    ),
+  completePluginAuth: (callback_url: string) =>
+    api.post<{ ok: boolean; result: string; provider_id?: string | null }>(
+      '/admin/api/plugins/auth/complete',
+      { callback_url },
+    ),
+  pluginAuthStatus: (state: string) =>
+    api.get<{ result: string; provider_id?: string | null }>(
+      `/admin/api/plugins/auth/status?state=${encodeURIComponent(state)}`,
     ),
   approvePluginPermissions: (id: string) =>
     api.post<{ ok: boolean; id: string; approved: PluginPermissionGrant[] }>(

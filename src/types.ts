@@ -43,6 +43,14 @@ export interface Provider {
   wirePlugin?: string;
   credentialPlugin?: string;
   modelSourcePlugin?: string;
+  credentialMode: 'manual' | 'auth_flow' | 'none';
+  sourcePluginId?: string;
+  sourceIntegrationId?: string;
+  credentialEnrollment: {
+    mode: 'manual' | 'auth_flow' | 'none';
+    actionLabel?: string | null;
+    available: boolean;
+  };
   /** Write-only: a credential supplied when adding/editing (never returned by the API). */
   apiKey?: string;
   accountLabel?: string;
@@ -58,28 +66,31 @@ export interface Account {
   status: 'healthy' | 'cooldown' | 'exhausted' | 'disabled';
   cooldownUntil?: string | null;
   quotaResetTime?: string | null;
-  quotaType: 'daily' | 'monthly' | 'none';
+  quotaType: 'daily' | 'monthly' | 'rolling' | 'none';
   softQuotaSpendLimit?: number;
   currentSpend: number;
   requestsCount: number;
   tokensCount: number;
   priority: number;
+  weight: number;
   lastError?: string;
 }
 
 export interface ModelCapability {
-  text: boolean;
-  vision: boolean;
-  reasoning: boolean;
-  toolCalling: boolean;
-  audio: boolean;
+  text?: boolean;
+  vision?: boolean;
+  reasoning?: boolean;
+  toolCalling?: boolean;
+  audio?: boolean;
+  structuredOutput?: boolean;
 }
 
 export interface ModelPrice {
-  inputPer1M: number;
-  outputPer1M: number;
-  cachedPer1M: number;
-  thinkingPer1M: number;
+  inputPer1M: number | null;
+  outputPer1M: number | null;
+  cachedPer1M: number | null;
+  cacheWritePer1M: number | null;
+  thinkingPer1M: number | null;
 }
 
 export interface ModelConfig {
@@ -89,8 +100,8 @@ export interface ModelConfig {
   upstreamModelId: string;
   displayName: string;
   enabled: boolean;
-  contextWindow: number;
-  maxOutputTokens: number;
+  contextWindow: number | null;
+  maxOutputTokens: number | null;
   capabilities: ModelCapability;
   prices: ModelPrice;
   parameters: {
@@ -99,10 +110,13 @@ export interface ModelConfig {
     top_k?: { supported: boolean; min: number; max: number; default: number; policy: 'forward' | 'clamp' | 'reject' };
   };
   thinkingMap: {
-    scale: 'off' | 'low' | 'medium' | 'high' | 'custom';
-    budgetTokens?: number;
-    mappedField: string;
+    levels: Record<string, unknown>;
+    mode?: 'manual_budget' | 'level' | 'adaptive';
+    budgetField?: string;
+    levelField?: string;
   };
+  transportOverride?: string | null;
+  discovery?: Record<string, unknown>;
 }
 
 export interface RouteTarget {
@@ -120,7 +134,7 @@ export interface Route {
   id: string;
   name: string;
   description: string;
-  selectionStrategy: 'priority' | 'round-robin' | 'weighted' | 'least-used';
+  selectionStrategy: 'priority' | 'round-robin' | 'weighted' | 'least-used' | 'adaptive';
   fallbackTriggers: {
     on429: boolean;
     onQuota: boolean;
@@ -128,7 +142,6 @@ export interface Route {
     onTimeout: boolean;
   };
   targets: RouteTarget[];
-  continuityPolicy: 'strip' | 'convert' | 'error';
   portabilityPolicy: 'reject' | 'strip_with_warning';
   cacheAffinity: boolean;
   stickyRouting: boolean;
@@ -164,6 +177,7 @@ export interface RequestLog {
   inputTokens: number;
   outputTokens: number;
   cachedTokens: number;
+  cacheWriteTokens: number;
   thinkingTokens: number;
   costUsd: number;
   cacheStatus: 'hit' | 'miss' | 'bypass';

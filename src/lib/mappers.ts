@@ -16,6 +16,10 @@ import {
 } from '../types';
 
 const num = (v: any, d = 0): number => (typeof v === 'number' && isFinite(v) ? v : d);
+const optionalBool = (v: any): boolean | undefined =>
+  typeof v === 'boolean' ? v : undefined;
+const optionalNum = (v: any): number | null =>
+  typeof v === 'number' && isFinite(v) ? v : null;
 const str = (v: any, d = ''): string => (typeof v === 'string' ? v : d);
 
 export function mapKey(j: any): VirtualKey {
@@ -46,7 +50,13 @@ export function mapProvider(j: any): Provider {
   const healthy = num(j.healthy_accounts);
   const total = num(j.accounts_count);
   const status: Provider['status'] =
-    total === 0 ? 'degraded' : healthy > 0 ? 'healthy' : 'error';
+    j.credential_mode === 'none'
+      ? 'healthy'
+      : total === 0
+        ? 'degraded'
+        : healthy > 0
+          ? 'healthy'
+          : 'error';
   return {
     id: str(j.id),
     name: str(j.name),
@@ -68,6 +78,20 @@ export function mapProvider(j: any): Provider {
     wirePlugin: str(j.wire_plugin),
     credentialPlugin: str(j.credential_plugin),
     modelSourcePlugin: str(j.model_source_plugin),
+    credentialMode:
+      j.credential_mode === 'auth_flow' || j.credential_mode === 'none'
+        ? j.credential_mode
+        : 'manual',
+    sourcePluginId: j.source_plugin_id ?? undefined,
+    sourceIntegrationId: j.source_integration_id ?? undefined,
+    credentialEnrollment: {
+      mode:
+        j.credential_enrollment?.mode === 'auth_flow' || j.credential_enrollment?.mode === 'none'
+          ? j.credential_enrollment.mode
+          : 'manual',
+      actionLabel: j.credential_enrollment?.action_label ?? null,
+      available: j.credential_enrollment?.available !== false,
+    },
     lastPingMs: 0,
   };
 }
@@ -76,15 +100,20 @@ export function mapModel(j: any): ModelConfig {
   const c = j.capabilities || {};
   const p = j.prices || {};
   const prices: ModelPrice = {
-    inputPer1M: num(p.input_per_1m),
-    outputPer1M: num(p.output_per_1m),
-    cachedPer1M: num(p.cached_per_1m),
-    thinkingPer1M: num(p.thinking_per_1m),
+    inputPer1M: optionalNum(p.input_per_1m),
+    outputPer1M: optionalNum(p.output_per_1m),
+    cachedPer1M: optionalNum(p.cached_per_1m),
+    cacheWritePer1M: optionalNum(p.cache_write_per_1m),
+    thinkingPer1M: optionalNum(p.thinking_per_1m),
   };
-  const thinkingMap = j.thinking_map || {};
-  const scale = (thinkingMap.levels && Object.keys(thinkingMap.levels).length
-    ? 'custom'
-    : 'off') as ModelConfig['thinkingMap']['scale'];
+  const thinkingMap =
+    j.thinking_map && typeof j.thinking_map === 'object' ? j.thinking_map : {};
+  const thinkingLevels =
+    thinkingMap.levels &&
+    typeof thinkingMap.levels === 'object' &&
+    !Array.isArray(thinkingMap.levels)
+      ? { ...thinkingMap.levels }
+      : {};
   return {
     id: str(j.id),
     providerId: str(j.provider_id),
@@ -92,24 +121,43 @@ export function mapModel(j: any): ModelConfig {
     upstreamModelId: str(j.upstream_id),
     displayName: str(j.display_name),
     enabled: !!j.enabled,
-    contextWindow: num(j.context_window, 0),
-    maxOutputTokens: num(j.max_output_tokens, 0),
+    contextWindow: optionalNum(j.context_window),
+    maxOutputTokens: optionalNum(j.max_output_tokens),
     capabilities: {
-      text: !!c.text,
-      vision: !!c.vision,
-      reasoning: !!c.reasoning,
-      toolCalling: !!c.tool_calling,
-      audio: !!c.audio,
+      text: optionalBool(c.text),
+      vision: optionalBool(c.vision),
+      reasoning: optionalBool(c.reasoning),
+      toolCalling: optionalBool(c.tool_calling),
+      audio: optionalBool(c.audio),
+      structuredOutput: optionalBool(c.structured_output),
     },
     prices,
     parameters: (j.parameters && typeof j.parameters === 'object'
       ? j.parameters
       : {}) as ModelConfig['parameters'],
+    transportOverride:
+      typeof j.transport_override === 'string' ? j.transport_override : null,
     thinkingMap: {
-      scale,
-      budgetTokens: undefined,
-      mappedField: str(thinkingMap.budget_field, ''),
+      levels: thinkingLevels,
+      mode:
+        thinkingMap.mode === 'manual_budget' ||
+        thinkingMap.mode === 'level' ||
+        thinkingMap.mode === 'adaptive'
+          ? thinkingMap.mode
+          : undefined,
+      budgetField:
+        typeof thinkingMap.budget_field === 'string' && thinkingMap.budget_field
+          ? thinkingMap.budget_field
+          : undefined,
+      levelField:
+        typeof thinkingMap.level_field === 'string' && thinkingMap.level_field
+          ? thinkingMap.level_field
+          : undefined,
     },
+    discovery:
+      j.discovery && typeof j.discovery === 'object' && !Array.isArray(j.discovery)
+        ? { ...j.discovery }
+        : {},
   };
 }
 
@@ -129,6 +177,7 @@ export function mapAccount(j: any): Account {
     requestsCount: num(j.requests_count),
     tokensCount: num(j.tokens_count),
     priority: num(j.priority, 1),
+    weight: num(j.weight, 1),
     lastError: j.last_error ?? undefined,
   };
 }
@@ -158,7 +207,6 @@ export function mapRoute(j: any): Route {
       priority: num(x.priority, idx + 1),
       weight: num(x.weight, 1),
     })),
-    continuityPolicy: (j.continuity_policy as Route['continuityPolicy']) || 'strip',
     portabilityPolicy: (j.portability_policy as Route['portabilityPolicy']) || 'strip_with_warning',
     cacheAffinity: !!j.cache_affinity,
     stickyRouting: !!j.sticky_routing,
@@ -218,6 +266,7 @@ export function mapRequest(j: any): RequestLog {
     inputTokens: num(j.input_tokens),
     outputTokens: num(j.output_tokens),
     cachedTokens: num(j.cached_tokens),
+    cacheWriteTokens: num(j.cache_write_tokens),
     thinkingTokens: num(j.thinking_tokens),
     costUsd: num(j.cost_usd),
     cacheStatus: (j.cache_status as RequestLog['cacheStatus']) || 'bypass',

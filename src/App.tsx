@@ -17,10 +17,11 @@ import { ProvidersView } from './components/views/ProvidersView';
 import { AccountsView } from './components/views/AccountsView';
 import { UsageView } from './components/views/UsageView';
 import { RequestsView } from './components/views/RequestsView';
+import { HealthView } from './components/views/HealthView';
 import { LiveRequest } from './types';
 import { AliasesView } from './components/views/AliasesView';
 import { AuditView } from './components/views/AuditView';
-import { SquiggleDivider, SketchButton, SketchBadge } from './components/HandDrawnElements';
+import { SquiggleDivider } from './components/HandDrawnElements';
 import { EMPTY_METRICS } from './lib/mappers';
 import { Kinetix, ExportFile, UsageDay } from './lib/resources';
 import { SettingsView } from './components/views/SettingsView';
@@ -38,7 +39,7 @@ import {
   RequestLog,
   ProxyMetrics,
 } from './types';
-import { Play, AlertTriangle } from 'lucide-react';
+import { AlertTriangle } from 'lucide-react';
 
 type AuthState = 'checking' | 'signed-out' | 'signed-in';
 
@@ -255,7 +256,6 @@ export default function App() {
         description: newRoute.description,
         strategy: newRoute.selectionStrategy,
         fallback_triggers: newRoute.fallbackTriggers,
-        continuity_policy: newRoute.continuityPolicy,
         portability_policy: newRoute.portabilityPolicy,
         cache_affinity: newRoute.cacheAffinity,
         sticky_routing: newRoute.stickyRouting,
@@ -275,7 +275,6 @@ export default function App() {
         description: updated.description,
         strategy: updated.selectionStrategy,
         fallback_triggers: updated.fallbackTriggers,
-        continuity_policy: updated.continuityPolicy,
         portability_policy: updated.portabilityPolicy,
         cache_affinity: updated.cacheAffinity,
         sticky_routing: updated.stickyRouting,
@@ -340,29 +339,48 @@ export default function App() {
 
   const handleDeleteProvider = (providerId: string) =>
     withRefresh(() => Kinetix.deleteProvider(providerId));
+
+  const modelCapabilitiesPayload = (model: ModelConfig): Record<string, boolean> => {
+    const out: Record<string, boolean> = {};
+    const fields: [string, boolean | undefined][] = [
+      ['text', model.capabilities.text],
+      ['vision', model.capabilities.vision],
+      ['reasoning', model.capabilities.reasoning],
+      ['tool_calling', model.capabilities.toolCalling],
+      ['audio', model.capabilities.audio],
+      ['structured_output', model.capabilities.structuredOutput],
+    ];
+    for (const [key, value] of fields) {
+      if (typeof value === 'boolean') out[key] = value;
+    }
+    return out;
+  };
+
   const handleAddModel = (model: ModelConfig) =>
     withRefresh(() =>
       Kinetix.createModel(model.providerId, {
         upstream_id: model.upstreamModelId,
         display_name: model.displayName,
+        transport_override: model.transportOverride ?? null,
         enabled: model.enabled,
         context_window: model.contextWindow,
         max_output_tokens: model.maxOutputTokens,
-        capabilities: {
-          text: model.capabilities.text,
-          vision: model.capabilities.vision,
-          reasoning: model.capabilities.reasoning,
-          tool_calling: model.capabilities.toolCalling,
-          audio: model.capabilities.audio,
-        },
+        capabilities: modelCapabilitiesPayload(model),
         prices: {
           input_per_1m: model.prices.inputPer1M,
           output_per_1m: model.prices.outputPer1M,
           cached_per_1m: model.prices.cachedPer1M,
+          cache_write_per_1m: model.prices.cacheWritePer1M,
           thinking_per_1m: model.prices.thinkingPer1M,
         },
         parameters: model.parameters,
-        thinking_map: model.thinkingMap,
+        thinking_map: {
+          levels: model.thinkingMap.levels,
+          mode: model.thinkingMap.mode || null,
+          budget_field: model.thinkingMap.budgetField || null,
+          level_field: model.thinkingMap.levelField || null,
+        },
+        discovery: model.discovery || {},
       }),
     );
 
@@ -373,24 +391,25 @@ export default function App() {
       Kinetix.updateModel(model.id, {
         upstream_id: model.upstreamModelId,
         display_name: model.displayName,
+        transport_override: model.transportOverride ?? null,
         enabled: model.enabled,
         context_window: model.contextWindow,
         max_output_tokens: model.maxOutputTokens,
-        capabilities: {
-          text: model.capabilities.text,
-          vision: model.capabilities.vision,
-          reasoning: model.capabilities.reasoning,
-          tool_calling: model.capabilities.toolCalling,
-          audio: model.capabilities.audio,
-        },
+        capabilities: modelCapabilitiesPayload(model),
         prices: {
           input_per_1m: model.prices.inputPer1M,
           output_per_1m: model.prices.outputPer1M,
           cached_per_1m: model.prices.cachedPer1M,
+          cache_write_per_1m: model.prices.cacheWritePer1M,
           thinking_per_1m: model.prices.thinkingPer1M,
         },
         parameters: model.parameters,
-        thinking_map: model.thinkingMap,
+        thinking_map: {
+          levels: model.thinkingMap.levels,
+          mode: model.thinkingMap.mode || null,
+          budget_field: model.thinkingMap.budgetField || null,
+          level_field: model.thinkingMap.levelField || null,
+        },
       }),
     );
 
@@ -401,6 +420,7 @@ export default function App() {
         label: acc.label,
         api_key: acc.apiKey,
         priority: acc.priority,
+        weight: acc.weight,
         soft_quota_usd: acc.softQuotaSpendLimit ?? null,
         quota_type: acc.quotaType,
       }),
@@ -409,16 +429,21 @@ export default function App() {
   const handleUpdateAccount = (acc: Account) =>
     withRefresh(() =>
       Kinetix.updateAccount(acc.id, {
+        provider_id: acc.providerId,
         label: acc.label,
         priority: acc.priority,
-        weight: 1,
+        weight: acc.weight,
         soft_quota_usd: acc.softQuotaSpendLimit ?? null,
         quota_type: acc.quotaType,
+        status: acc.status,
       }),
     );
 
   const handleDeleteAccount = (accountId: string) =>
     withRefresh(() => Kinetix.deleteAccount(accountId));
+
+  const handleResetAccount = (accountId: string) =>
+    withRefresh(() => Kinetix.resetAccount(accountId));
 
   const handleAddAlias = (alias: ModelAlias) =>
     withRefresh(() =>
@@ -522,6 +547,8 @@ export default function App() {
             onAddAccount={handleAddAccount}
             onUpdateAccount={handleUpdateAccount}
             onDeleteAccount={handleDeleteAccount}
+            onResetAccount={handleResetAccount}
+            onRefresh={refresh}
           />
         )}
 
@@ -543,6 +570,8 @@ export default function App() {
         {activeTab === 'requests' && (
           <RequestsView requests={requests} liveRequests={liveRequests} />
         )}
+
+        {activeTab === 'health' && <HealthView />}
 
         {activeTab === 'aliases' && (
           <AliasesView
@@ -577,18 +606,6 @@ export default function App() {
             OpenAI &amp; Anthropic streaming in • Gemini, OpenAI, &amp; Anthropic upstream out • SQLite WAL at rest
           </p>
         </footer>
-      </div>
-
-      <div className="fixed bottom-6 right-6 z-40">
-        <SketchButton
-          variant="danger"
-          size="lg"
-          onClick={() => setIsTesterOpen(true)}
-          className="gap-2 font-heading font-bold shadow-lg shadow-black/10"
-        >
-          <Play className="w-5 h-5 fill-[var(--surface)]" />
-          Test Proxy Live
-        </SketchButton>
       </div>
 
       <LiveTesterModal

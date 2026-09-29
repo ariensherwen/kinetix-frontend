@@ -30,8 +30,6 @@ interface ExecMeta {
  * parsed back into text for display, and the Kinetix response headers are read off
  * the live response.
  */
-const DEMO_MODE = import.meta.env.VITE_KINETIX_DEMO !== 'false' && import.meta.env.VITE_KINETIX_DEMO !== '0';
-
 export const LiveTesterModal: React.FC<LiveTesterModalProps> = ({
   isOpen,
   onClose,
@@ -94,26 +92,6 @@ export const LiveTesterModal: React.FC<LiveTesterModalProps> = ({
     setOutput('');
     setError(null);
     setMeta(null);
-
-    if (DEMO_MODE) {
-      const chosen = models.find((m) => m.upstreamModelId === effectiveTarget || m.id === effectiveTarget) ?? models[0];
-      setOutput(`Demo response from ${chosen?.displayName ?? effectiveTarget ?? 'Kinetix'}: Testing`);
-      setMeta({
-        servingAccount: 'Demo credential pool',
-        servingProvider: chosen?.providerName ?? 'Demo Provider',
-        routeId: 'demo-route-trace',
-        fallbackHops: effectiveTarget.includes('coder') ? 1 : 0,
-        fallbackPath: effectiveTarget.includes('coder')
-          ? ['Demo primary → simulated 429', 'Demo fallback → 200 OK']
-          : ['Demo target → 200 OK'],
-        warnings: ['Standalone demo mode: no network request was sent.'],
-        ttftMs: 86,
-        latencyMs: 312,
-        statusCode: 200,
-      });
-      setIsLoading(false);
-      return;
-    }
 
     const controller = new AbortController();
     abortRef.current = controller;

@@ -1,9 +1,18 @@
 import React, { useState } from 'react';
-import { Shuffle, Plus, ArrowDown, ArrowUp, Shield, Check, Layers, ArrowRight, Trash2, AlertTriangle, PlayCircle } from 'lucide-react';
+import { Shuffle, Plus, ArrowDown, ArrowUp, Shield, Check, Layers, ArrowRight, Trash2, AlertTriangle, PlayCircle, Search, X } from 'lucide-react';
 import { Route, Account, ModelConfig } from '../../types';
 import { WobblyCard, SketchButton, SketchBadge } from '../HandDrawnElements';
 import { DESIGN_TOKENS } from '../../lib/designSystem';
 import { Kinetix } from '../../lib/resources';
+
+const ROUTE_STRATEGIES: ReadonlyArray<readonly [Route['selectionStrategy'], string]> = [
+  ['priority', 'Priority (Ordered fallback on failure)'],
+  ['round-robin', 'Round-robin load balancing'],
+  ['weighted', 'Weighted distribution'],
+  ['least-used', 'Least-used (prefer idle accounts)'],
+  ['adaptive', 'Adaptive (capacity + TTFT EWMA)'],
+];
+
 
 interface RoutesViewProps {
   routes: Route[];
@@ -30,11 +39,12 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
   const [selectedRouteId, setSelectedRouteId] = useState<string>(routes[0]?.id || '');
   const [confirmDeleteRouteId, setConfirmDeleteRouteId] = useState<string | null>(null);
   const [confirmRemoveTargetId, setConfirmRemoveTargetId] = useState<string | null>(null);
+  const [routeSearch, setRouteSearch] = useState('');
 
   // New route form
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
-  const [strategy, setStrategy] = useState<'priority' | 'round-robin' | 'weighted' | 'least-used'>('priority');
+  const [strategy, setStrategy] = useState<Route['selectionStrategy']>('priority');
   const [on429, setOn429] = useState(true);
   const [onQuota, setOnQuota] = useState(true);
   const [on5xx, setOn5xx] = useState(true);
@@ -46,7 +56,30 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
   const [newTargetModelId, setNewTargetModelId] = useState('');
   const [newTargetAccountId, setNewTargetAccountId] = useState('');
 
-  const activeRoute = routes.find((c) => c.id === selectedRouteId) || routes[0];
+  const normalizedRouteSearch = routeSearch.trim().toLowerCase();
+  const filteredRoutes = routes.filter((route) => {
+    if (!normalizedRouteSearch) return true;
+    const targetTerms = route.targets.flatMap((target) => {
+      const model = models.find((m) => m.id === target.modelId);
+      return [
+        target.modelId,
+        target.modelDisplayName,
+        target.providerName,
+        model?.upstreamModelId,
+        model?.displayName,
+      ];
+    });
+    return [
+      route.id,
+      route.name,
+      route.description,
+      route.selectionStrategy,
+      ...targetTerms,
+    ].some((value) => String(value ?? '').toLowerCase().includes(normalizedRouteSearch));
+  });
+  const activeRoute =
+    filteredRoutes.find((route) => route.id === selectedRouteId) ||
+    filteredRoutes[0];
 
   /** Renumber targets by their (already ordered) position. */
   const renumber = (targets: Route['targets']): Route['targets'] =>
@@ -120,7 +153,6 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
         onTimeout: true,
       },
       targets: [],
-      continuityPolicy: 'strip',
       portabilityPolicy: 'strip_with_warning',
       cacheAffinity: true,
       stickyRouting: sticky,
@@ -186,10 +218,36 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
           <div className="space-y-4">
             <h3 className="text-xl font-heading font-bold text-[var(--ink)] flex items-center gap-2">
               <Shuffle className="w-5 h-5 text-[var(--pen-blue)]" />
-              Configured Routes ({routes.length})
+              Configured Routes ({filteredRoutes.length}/{routes.length})
             </h3>
 
-            {routes.map((route, idx) => {
+            <div className="relative">
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-[var(--ink)]/50" />
+              <input
+                type="search"
+                value={routeSearch}
+                onChange={(e) => setRouteSearch(e.target.value)}
+                placeholder="Search routes…"
+                className="w-full pl-9 pr-9 py-2 bg-[var(--surface)] border-2 border-[var(--ink)] font-mono text-sm focus:outline-none focus:border-[var(--pen-blue)]"
+                style={{ borderRadius: DESIGN_TOKENS.radii.wobblyMd }}
+              />
+              {routeSearch && (
+                <button type="button" onClick={() => setRouteSearch('')} className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-[var(--ink)]/60 hover:text-[var(--marker-red)] cursor-pointer" title="Clear search">
+                  <X className="w-4 h-4" />
+                </button>
+              )}
+            </div>
+
+            {filteredRoutes.length === 0 && (
+              <div className="p-5 text-center bg-[var(--surface)] border-2 border-dashed border-[var(--ink)]/30 rounded">
+                <p className="text-sm font-mono text-[var(--ink)]/70">No routes match “{routeSearch}”.</p>
+                <button onClick={() => setRouteSearch('')} className="mt-2 text-xs font-heading font-bold text-[var(--pen-blue)] hover:underline cursor-pointer">
+                  Clear search
+                </button>
+              </div>
+            )}
+
+            {filteredRoutes.map((route, idx) => {
               const isSelected = route.id === activeRoute?.id;
               const tilt = idx % 2 === 0 ? '-rotate-0.5' : 'rotate-0.5';
 
@@ -458,6 +516,28 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
 
               {/* Route Policies & Triggers Settings */}
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4 bg-[var(--paper)] p-4 border-2 border-[var(--ink)] rounded-lg">
+                <div className="md:col-span-2">
+                  <label className="block text-sm font-heading font-bold text-[var(--ink)] mb-1">
+                    Selection Strategy
+                  </label>
+                  <select
+                    value={activeRoute.selectionStrategy}
+                    onChange={(e) =>
+                      onUpdateRoute({
+                        ...activeRoute,
+                        selectionStrategy: e.target.value as Route['selectionStrategy'],
+                      })
+                    }
+                    className="w-full bg-[var(--surface)] border border-[var(--ink)] px-2 py-1.5 text-sm font-mono rounded"
+                  >
+                    {ROUTE_STRATEGIES.map(([value, label]) => (
+                      <option key={value} value={value}>
+                        {label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
                 <div>
                   <h5 className="font-heading font-bold text-base text-[var(--ink)] mb-2 flex items-center gap-1">
                     <Shield className="w-4 h-4 text-[var(--pen-blue)]" />
@@ -531,26 +611,6 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
                       />
                       <span>Sticky routing (Preserves prompt cache while target healthy)</span>
                     </label>
-
-                    <div className="pt-1">
-                      <span className="text-xs font-mono text-[var(--ink)]/70 block mb-1">
-                        Cross-Provider Content Policy:
-                      </span>
-                      <select
-                        value={activeRoute.continuityPolicy}
-                        onChange={(e) =>
-                          onUpdateRoute({
-                            ...activeRoute,
-                            continuityPolicy: e.target.value as any,
-                          })
-                        }
-                        className="bg-[var(--surface)] border border-[var(--ink)] px-2 py-1 text-xs font-mono rounded w-full"
-                      >
-                        <option value="strip">Strip proprietary thinking tokens / vendor signatures</option>
-                        <option value="convert">Convert where target equivalent exists</option>
-                        <option value="error">Error on non-portable conversation turn</option>
-                      </select>
-                    </div>
 
                     <div className="pt-1">
                       <span className="text-xs font-mono text-[var(--ink)]/70 block mb-1">
@@ -710,14 +770,15 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
                   </label>
                   <select
                     value={strategy}
-                    onChange={(e) => setStrategy(e.target.value as any)}
+                    onChange={(e) => setStrategy(e.target.value as Route['selectionStrategy'])}
                     className="w-full bg-[var(--surface)] border-2 border-[var(--ink)] px-3 py-2 text-base sketch-shadow-sm focus:outline-none font-mono"
                     style={{ borderRadius: DESIGN_TOKENS.radii.wobblyMd }}
                   >
-                    <option value="priority">Priority (Ordered fallback on failure)</option>
-                    <option value="round-robin">Round-robin load balancing</option>
-                    <option value="weighted">Weighted distribution</option>
-                    <option value="least-used">Least-used (prefer idle accounts)</option>
+                    {ROUTE_STRATEGIES.map(([value, label]) => (
+                      <option key={value} value={value}>
+                        {label}
+                      </option>
+                    ))}
                   </select>
                 </div>
 
